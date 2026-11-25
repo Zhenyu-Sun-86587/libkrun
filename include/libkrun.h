@@ -558,6 +558,46 @@ int32_t krun_add_net_tap(uint32_t ctx_id,
                          uint32_t features,
                          uint32_t flags);
 
+#define KRUN_NET_TAP_FD_V1 1
+#define KRUN_NET_TAP_FD_DEVICE_ID_MAX 64
+#define KRUN_NET_TAP_FD_VNET_HEADER_SIZE 12
+#define KRUN_NET_TAP_FD_MTU 1500
+#define KRUN_NET_TAP_FD_FEATURES (NET_FEATURE_CSUM | NET_FEATURE_GUEST_CSUM)
+
+struct krun_net_tap_fd_spec_v1 {
+    uint32_t size;
+    uint32_t version;
+    char device_id[KRUN_NET_TAP_FD_DEVICE_ID_MAX];
+    uint32_t features;
+    uint16_t mtu;
+    uint16_t queue_count;
+    uint16_t vnet_header_size;
+    uint8_t mac[6];
+    uint8_t attachment_digest[32];
+};
+
+/**
+ * Add a Linux virtio-net device from an attached read-write, nonblocking,
+ * single-queue TAP descriptor. The TAP must use IFF_NO_PI, IFF_VNET_HDR and
+ * the 12-byte little-endian virtio header. The caller provisions the TAP MTU
+ * and closes its packet gate before handing the descriptor to libkrun.
+ *
+ * Fill size and version and provide a unique, NUL-terminated device_id.
+ * Use queue_count=1, the MTU and header constants above, and a subset of
+ * KRUN_NET_TAP_FD_FEATURES. Supply the SHA-256 bytes of the attachment
+ * descriptor and a nonzero unicast guest MAC. In a restore, configure the
+ * same device ID and layout, and supply the new attachment digest and FD.
+ *
+ * The FD is borrowed for the duration of this call. Success retains a
+ * close-on-exec duplicate. The caller retains its FD on success and failure.
+ * This function does not change namespaces or release the host packet gate.
+ *
+ * Returns zero on success or a negative error number on failure.
+ */
+int32_t krun_add_net_tap_fd_v1(uint32_t ctx_id,
+                              const struct krun_net_tap_fd_spec_v1 *spec,
+                              int32_t tap_fd);
+
 /**
  * Configures a map of host to guest TCP ports for the microVM.
  *
