@@ -38,7 +38,7 @@ class Tap(ct.Structure):
                 ("mac",ct.c_ubyte*6),("digest",ct.c_ubyte*32)]
 
 
-def boot(args, config):
+def boot(args, config, tap_attached=None):
     api = ct.CDLL(str(args.lib))
     ctx = api.krun_create_ctx()
     def call(name, *values):
@@ -52,6 +52,8 @@ def boot(args, config):
                  (ct.c_ubyte*32).from_buffer_copy(bytes.fromhex(tap["digest"])))
         call("krun_add_net_tap_fd_v1",ct.byref(spec),tap["fd"])
         os.close(tap["fd"])
+        if tap_attached:
+            tap_attached()
     call("krun_set_vm_config", 2, 512)
     call("krun_add_virtio_console_default", 0, 1, 2)
     call("krun_set_kernel_console", b"hvc0")
@@ -220,7 +222,8 @@ def run(args, directory):
                  + machine + bytes([len(hostname)]) + hostname).ljust(192, b"\0")
         if args.network:
             ip=socket.inet_aton
-            tail=(b"NET1"+bytes([1,24,24,0])+mac(source_number)+mac(epoch)+ip(address(source_number)+"2")+
+            prefix=32 if args.host_route else 24
+            tail=(b"NET1"+bytes([1,prefix,prefix,0])+mac(source_number)+mac(epoch)+ip(address(source_number)+"2")+
                   ip(address(epoch)+"2")+ip(address(source_number)+"1")+ip(address(epoch)+"1")+ip(address(epoch)+"1")+
                   b"eth0".ljust(16,b"\0")+bytes(8))
             frame=b"SGI2\x02\0\0\0"+frame[8:]+tail
@@ -323,6 +326,7 @@ if __name__ == "__main__":
     parser.add_argument("--boot", type=Path)
     parser.add_argument("--work", type=Path)
     parser.add_argument("--network", action="store_true",help="isolated netns with CAP_NET_ADMIN and ping")
+    parser.add_argument("--host-route",action="store_true", help="probe a /32 Guest built with MANAGED_HOST_ROUTE")
     args = parser.parse_args()
     args.lib = args.lib.resolve()
     if args.boot:

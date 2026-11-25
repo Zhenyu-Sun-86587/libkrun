@@ -35,13 +35,25 @@ static int configure_uplink(void)
     memcpy(&ifr.ifr_addr, &addr, sizeof(addr));
     if (ioctl(fd, SIOCSIFADDR, &ifr))
         goto fail;
+#ifdef MANAGED_HOST_ROUTE
+    addr.sin_addr.s_addr = INADDR_BROADCAST;
+#else
     inet_pton(AF_INET, "255.255.255.0", &addr.sin_addr);
+#endif
     memcpy(&ifr.ifr_netmask, &addr, sizeof(addr));
     if (ioctl(fd, SIOCSIFNETMASK, &ifr))
         goto fail;
     struct rtentry route = { .rt_flags = RTF_UP | RTF_GATEWAY, .rt_dev = ifr.ifr_name };
     route.rt_dst.sa_family = route.rt_genmask.sa_family = AF_INET;
     inet_pton(AF_INET, "10.91.0.1", &addr.sin_addr);
+#ifdef MANAGED_HOST_ROUTE
+    struct rtentry peer = { .rt_flags = RTF_UP | RTF_HOST, .rt_dev = ifr.ifr_name };
+    memcpy(&peer.rt_dst, &addr, sizeof(addr));
+    struct sockaddr_in mask = { .sin_family = AF_INET, .sin_addr = { INADDR_BROADCAST } };
+    memcpy(&peer.rt_genmask, &mask, sizeof(mask));
+    if (ioctl(fd, SIOCADDRT, &peer))
+        goto fail;
+#endif
     memcpy(&route.rt_gateway, &addr, sizeof(addr));
     if (ioctl(fd, SIOCADDRT, &route))
         goto fail;
