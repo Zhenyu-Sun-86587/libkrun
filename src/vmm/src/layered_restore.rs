@@ -47,6 +47,8 @@ pub struct ExtentDescription {
 #[derive(Clone)]
 pub struct Generation {
     regions: Vec<Image>,
+    #[cfg(feature = "blk")]
+    verified_durable_file: bool,
 }
 
 impl Generation {
@@ -277,6 +279,18 @@ impl Generation {
         Self::from_descriptions_with_files(None, &descriptions, files)
     }
 
+    /// Construct a generation from a regular RAM file already verified by the
+    /// authenticated Worker and opened read-only in its private store.
+    #[cfg(feature = "blk")]
+    pub fn from_verified_statepoint_file(
+        descs: &[crate::snapshot::MemoryRegionDesc],
+        file: &File,
+    ) -> io::Result<Self> {
+        let mut generation = Self::from_immutable_file(descs, file)?;
+        generation.verified_durable_file = true;
+        Ok(generation)
+    }
+
     /// Adopt a running source's own memfd regions as its first generation
     /// without copying a byte. Every region must map a file that already
     /// carries the write seal ([`crate::snapshot::rebase_guest_memory_private`]
@@ -418,7 +432,11 @@ impl Generation {
             });
             previous_end = end;
         }
-        Ok(Self { regions })
+        Ok(Self {
+            regions,
+            #[cfg(feature = "blk")]
+            verified_durable_file: false,
+        })
     }
 
     #[cfg(feature = "blk")]
@@ -428,6 +446,7 @@ impl Generation {
             self.regions
                 .iter()
                 .flat_map(|region| region.extents.iter().map(|extent| Arc::clone(&extent.file))),
+            self.verified_durable_file,
         )
     }
 
@@ -572,7 +591,11 @@ impl Generation {
                 .ok_or_else(|| invalid("copied RAM size overflow"))?;
             regions.push(next);
         }
-        let next = Self { regions };
+        let next = Self {
+            regions,
+            #[cfg(feature = "blk")]
+            verified_durable_file: self.verified_durable_file,
+        };
         next.check_limits()?;
         Ok((next, copied))
     }
@@ -2284,6 +2307,8 @@ fn consolidation_preserves_contents_and_keeps_zero_pages_as_holes() {
     let (image, copied) = instance.capture_quiesced_within(limits).unwrap();
     let next = Generation {
         regions: vec![image],
+        #[cfg(feature = "blk")]
+        verified_durable_file: false,
     };
     assert_eq!(copied, PAGES * page);
     assert_eq!(next.regions[0].extents.len(), 1);

@@ -149,7 +149,6 @@ pub fn verify_parked_block_binding(
     if source[0] != target[0]
         || source[1] != old.volume_id
         || target[1] != new.volume_id
-        || old.volume_id == new.volume_id
         || old.head_resource_id == new.head_resource_id
         || old.grant_id == new.grant_id
         || source[3] != target[3]

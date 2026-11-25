@@ -12,6 +12,8 @@ pub(crate) struct BlockInfo {
     capacity_bytes: u64,
     read_only: bool,
     managed_attachment: Option<ManagedAttachment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    managed_backing_identities: Option<Vec<(u64, u64)>>,
 }
 
 #[derive(Serialize)]
@@ -99,6 +101,9 @@ impl DeviceInfo {
                 capacity_bytes: b.capacity_bytes(),
                 read_only: b.is_read_only(),
                 managed_attachment: b.managed_attachment().cloned(),
+                managed_backing_identities: b
+                    .managed_backing_identities()
+                    .map(|identities| identities.to_vec()),
             }),
         })
     }

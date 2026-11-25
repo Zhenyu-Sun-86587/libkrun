@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ const MAX_PACKET: usize = 64 * 1024;
 const MAX_FDS: usize = 64;
 const PROTOCOL: &str = "WorkerResource/1";
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Config {
     socket: PathBuf,
@@ -35,9 +35,69 @@ pub(super) struct Config {
 pub(super) struct RestoreScope {
     operation_id: String,
     request_digest: String,
-    source_pivot_id: String,
+    pub(super) source_pivot_id: String,
     grant_id: String,
     expected_revision: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatePointScope {
+    operation_id: String,
+    request_digest: String,
+    capture_id: String,
+    lease_id: String,
+    #[serde(default)]
+    volume_restore_policy: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatePointRegion {
+    gpa: u64,
+    length: u64,
+}
+
+pub(super) struct PreparedStatePoint {
+    pub checkpoint: Vec<u8>,
+    pub generation: vmm::layered_restore::Generation,
+    pub source_operation_id: String,
+    pub lease_id: String,
+    pub disk_identities: BTreeMap<String, String>,
+}
+
+impl PreparedStatePoint {
+    pub fn verify_read_only_disks(
+        &self,
+        resources: &vmm::resources::VmResources,
+    ) -> Result<(), String> {
+        for device in &resources.block.list {
+            let block = device.lock().unwrap();
+            if !block.is_read_only() {
+                continue;
+            }
+            let attachment = block
+                .managed_attachment()
+                .ok_or("StatePoint requires managed read-only disks")?;
+            let identities = block
+                .managed_backing_identities()
+                .ok_or("StatePoint has no opened backing identities")?;
+            if identities.len() != attachment.layers.len()
+                || attachment
+                    .layers
+                    .iter()
+                    .zip(identities)
+                    .any(|(layer, (dev, ino))| {
+                        self.disk_identities.get(layer) != Some(&format!("inode:{dev}:{ino}"))
+                    })
+            {
+                return Err(
+                    "read-only disk differs from its verified StatePoint generation".into(),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -174,6 +234,165 @@ impl Config {
         }
         result
     }
+
+    fn acquire_statepoint(&self, scope: &StatePointScope) -> Result<PreparedStatePoint, String> {
+        let operation = (scope.operation_id.as_str(), scope.request_digest.as_str());
+        let policy = scope
+            .volume_restore_policy
+            .as_deref()
+            .unwrap_or("clone_conflicts");
+        let reply = self.request("AcquireStatePointRestore", operation,
+            json!({"capture_id":scope.capture_id,"lease_id":scope.lease_id,"volume_restore_policy":policy}), &[], &[])
+            .map_err(|error| error.render())?;
+        let lease = &reply.result["lease"];
+        let resource = lease["resource_id"]
+            .as_str()
+            .ok_or("Worker StatePoint has no representation")?;
+        let source_operation_id = reply.result["source_operation_id"]
+            .as_str()
+            .filter(|id| valid_id(id))
+            .ok_or("Worker StatePoint has no source operation")?
+            .to_owned();
+        if reply.result["capture_id"] != scope.capture_id
+            || reply.result["volume_restore_policy"] != policy
+            || lease["lease_id"] != scope.lease_id
+            || lease["incarnation_id"] != self.incarnation_id
+            || lease["operation_id"] != scope.operation_id
+            || lease["state"] != "pending"
+            || lease["revision"].as_i64() != Some(1)
+            || reply.table.len() != 2
+            || reply.table[0].role != "statepoint_checkpoint"
+            || reply.table[1].role != "statepoint_ram"
+            || reply
+                .table
+                .iter()
+                .any(|entry| entry.resource_id != resource)
+        {
+            return Err("Worker StatePoint receipt does not match the target execution".into());
+        }
+        let [cpu, ram]: [OwnedFd; 2] = reply
+            .fds
+            .try_into()
+            .map_err(|_| "Worker StatePoint has an incomplete descriptor pair")?;
+        let mut bytes = Vec::new();
+        let length = reply.result["checkpoint_bytes"]
+            .as_u64()
+            .filter(|length| (1..=64 * 1024 * 1024).contains(length))
+            .ok_or("Worker StatePoint checkpoint length is invalid")?;
+        File::from(cpu)
+            .take(length + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() as u64 != length {
+            return Err("Worker StatePoint checkpoint was truncated".into());
+        }
+        vmm::VmCheckpoint::deserialize(&bytes)?;
+        let regions: Vec<StatePointRegion> =
+            serde_json::from_value(reply.result["regions"].clone())
+                .map_err(|error| error.to_string())?;
+        let regions: Vec<_> = regions
+            .into_iter()
+            .map(|region| vmm::snapshot::MemoryRegionDesc {
+                gpa: region.gpa,
+                len: region.length,
+            })
+            .collect();
+        let generation = vmm::layered_restore::Generation::from_verified_statepoint_file(
+            &regions,
+            &File::from(ram),
+        )
+        .map_err(|error| error.to_string())?;
+        let disk_identities = serde_json::from_value(reply.result["disk_identities"].clone())
+            .map_err(|error| error.to_string())?;
+        let confirmed = self
+            .request(
+                "AckStatePointAttached",
+                operation,
+                json!({"lease_id":scope.lease_id,"expected_revision":1}),
+                &[],
+                &[],
+            )
+            .map_err(|error| error.render())?;
+        if !confirmed.fds.is_empty()
+            || confirmed.result["lease_id"] != scope.lease_id
+            || confirmed.result["resource_id"] != resource
+            || confirmed.result["incarnation_id"] != self.incarnation_id
+            || confirmed.result["operation_id"] != scope.operation_id
+            || confirmed.result["state"] != "attached"
+            || confirmed.result["revision"].as_i64() != Some(2)
+        {
+            return Err("Worker did not attach the recovered StatePoint lease".into());
+        }
+        Ok(PreparedStatePoint {
+            checkpoint: bytes,
+            generation,
+            source_operation_id,
+            lease_id: scope.lease_id.clone(),
+            disk_identities,
+        })
+    }
+}
+
+/// Acquire a verified durable StatePoint from this context's configured Worker.
+/// # Safety
+/// The configuration bytes must remain readable until this call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_configure_worker_statepoint_restore_v1(
+    ctx_id: u32,
+    config: *const u8,
+    length: usize,
+) -> i32 {
+    if config.is_null() || length == 0 || length > 4096 {
+        return -libc::EINVAL;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(config, length) };
+    let Ok(scope) = serde_json::from_slice::<StatePointScope>(bytes) else {
+        return -libc::EINVAL;
+    };
+    if !valid_id(&scope.operation_id)
+        || !valid_digest(&scope.request_digest)
+        || !valid_id(&scope.capture_id)
+        || !valid_id(&scope.lease_id)
+        || scope
+            .volume_restore_policy
+            .as_deref()
+            .is_some_and(|policy| !matches!(policy, "exact" | "clone_conflicts"))
+    {
+        return -libc::EINVAL;
+    }
+    let config = {
+        let contexts = super::CTX_MAP.lock().unwrap();
+        let Some(context) = contexts.get(&ctx_id) else {
+            return -libc::ENOENT;
+        };
+        if context.worker_statepoint.is_some()
+            || context.snapshot_dir.is_some()
+            || context.diskless_snapshot_ram.is_some()
+            || context.snapshot_memory.is_some()
+        {
+            return -libc::EINVAL;
+        }
+        let Some(config) = context.worker_pivot.clone() else {
+            return -libc::EINVAL;
+        };
+        config
+    };
+    let prepared = match config.acquire_statepoint(&scope) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            super::set_last_error(error);
+            return -libc::EINVAL;
+        }
+    };
+    let mut contexts = super::CTX_MAP.lock().unwrap();
+    let Some(context) = contexts.get_mut(&ctx_id) else {
+        return -libc::ENOENT;
+    };
+    if context.worker_statepoint.is_some() || context.worker_pivot.as_ref() != Some(&config) {
+        return -libc::EBUSY;
+    }
+    context.worker_statepoint = Some(prepared);
+    0
 }
 
 pub(super) fn validate_parked_restore(
@@ -181,6 +400,7 @@ pub(super) fn validate_parked_restore(
     scope: Option<&RestoreScope>,
     resources: &vmm::resources::VmResources,
     checkpoint: &vmm::VmCheckpoint,
+    statepoint_lease: Option<&str>,
 ) -> Result<bool, String> {
     let (hold_token, writers) =
         vmm::managed_block_restore::preflight_restore_writers(checkpoint, resources)?;
@@ -235,7 +455,7 @@ pub(super) fn validate_parked_restore(
         .request(
             "ValidateRestoreWriterSet",
             (&scope.operation_id, &scope.request_digest),
-            json!({"origin":origin,"grant_id":scope.grant_id,
+            json!({"origin":origin,"grant_id":scope.grant_id,"statepoint_lease_id":statepoint_lease,
                 "expected_revision":scope.expected_revision,"heads":heads}),
             &table,
             &files,
@@ -316,6 +536,9 @@ pub unsafe extern "C" fn krun_configure_worker_block_pivot_v1(
     let Some(context) = contexts.get_mut(&ctx_id) else {
         return -libc::ENOENT;
     };
+    if context.worker_statepoint.is_some() {
+        return -libc::EBUSY;
+    }
     context.worker_pivot = Some(config);
     0
 }

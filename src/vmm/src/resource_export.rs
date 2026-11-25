@@ -68,6 +68,34 @@ fn backing_id(metadata: &Metadata) -> String {
     format!("ram-{:x}-{:x}", metadata.dev(), metadata.ino())
 }
 
+fn export_backing(
+    file: Arc<File>,
+    verified_durable_file: bool,
+) -> io::Result<(Arc<File>, Metadata)> {
+    match sealed(&file, false) {
+        Ok(metadata) => return Ok((file, metadata)),
+        Err(error) if !verified_durable_file => return Err(error),
+        Err(_) => (),
+    }
+    let info = file.metadata()?;
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if !info.is_file() || flags < 0 || flags & (libc::O_ACCMODE | libc::O_PATH) != libc::O_RDONLY {
+        return Err(invalid("durable RAM must use a verified read-only file"));
+    }
+    let len = usize::try_from(info.len())
+        .map_err(|_| invalid("durable RAM backing exceeds address space"))?;
+    let mut copy = crate::builder::create_guest_ram_memfd(len).map_err(io::Error::other)?;
+    if !crate::snapshot::copy_file_extents(&file, 0, info.len(), &mut copy, 0)? {
+        crate::snapshot::copy_file_range_sparse(&file, 0, info.len(), &mut copy, 0)?;
+    }
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    if unsafe { libc::fcntl(copy.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let metadata = sealed(&copy, false)?;
+    Ok((Arc::new(copy), metadata))
+}
+
 impl ResourceExport {
     pub const MAX_DESCRIPTOR_BYTES: usize = 64 * 1024;
     pub const MAX_BACKINGS: usize = 512;
@@ -110,6 +138,7 @@ impl ResourceExport {
     pub(crate) fn new(
         descriptions: Vec<RegionDescription>,
         files: impl Iterator<Item = Arc<File>>,
+        verified_durable_file: bool,
     ) -> io::Result<Self> {
         let mut backings = BTreeMap::new();
         let mut backing_sizes = BTreeMap::new();
@@ -117,7 +146,7 @@ impl ResourceExport {
         for file in files {
             if let std::collections::hash_map::Entry::Vacant(entry) = fd_ids.entry(file.as_raw_fd())
             {
-                let metadata = sealed(&file, false)?;
+                let (file, metadata) = export_backing(file, verified_durable_file)?;
                 let id = backing_id(&metadata);
                 backing_sizes.insert(id.clone(), metadata.len());
                 backings.entry(id.clone()).or_insert(file);
