@@ -65,6 +65,9 @@ pub mod resource_export;
 pub mod resources;
 #[cfg(target_os = "linux")]
 pub mod retained_fds;
+/// Re-export live managed VMM descriptors to a restarted Worker.
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "blk", not(feature = "tee")))]
+pub mod recovery_fds;
 /// Signal handling utilities.
 #[cfg(target_os = "linux")]
 pub mod signal_handler;

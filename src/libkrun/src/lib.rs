@@ -2128,6 +2128,7 @@ fn handle_control_stream(
                         | "CAPTURE_PREPARE"
                         | "CAPTURE_QUERY"
                         | "CAPTURE_EXPORT"
+                        | "CAPTURE_RECOVER_FDS"
                         | "CAPTURE_FINISH"
                         | "CAPTURE_CANCEL"
                         | "CAPTURE_DROP_EXPORT"
@@ -2213,6 +2214,22 @@ fn handle_control_stream(
                             return;
                         }
                         Err(e) => format!("ERR {e}\n"),
+                    }
+                }
+                #[cfg(all(
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    feature = "blk",
+                    not(feature = "tee")
+                ))]
+                "CAPTURE_RECOVER_FDS" => {
+                    if !vmm::retained_fds::worker_recovery_peer(&stream) {
+                        "ERR EPERM recovery requires the Worker control peer\n".into()
+                    } else {
+                        match vmm::recovery_fds::send(&stream, _arg) {
+                            Ok(()) => return,
+                            Err(error) => format!("ERR EIO {error}\n"),
+                        }
                     }
                 }
                 #[cfg(all(
