@@ -36,6 +36,8 @@ const HLEN_ETHERNET: u8 = 6;
 const DHCP_FLAG_BROADCAST: u16 = 0x8000;
 /// RFC 2132: marks options as DHCP format (99.130.83.99)
 const DHCP_MAGIC_COOKIE: u32 = 0x6382_5363;
+// linux/rtnetlink.h
+const RTNH_F_ONLINK: u32 = 4;
 
 // libc doesn't expose ifinfomsg, ifaddrmsg, or rtmsg — define them locally.
 
@@ -346,6 +348,7 @@ fn mod_route4(
     iface_index: i32,
     cmd: u16,
     gateway: u32,
+    on_link: bool,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; 4096];
     let base = mem::size_of::<libc::nlmsghdr>() + mem::size_of::<RtMsg>();
@@ -367,7 +370,7 @@ fn mod_route4(
         rtm_protocol: libc::RTPROT_BOOT,
         rtm_scope: libc::RT_SCOPE_UNIVERSE,
         rtm_type: libc::RTN_UNICAST,
-        rtm_flags: 0,
+        rtm_flags: if on_link { RTNH_F_ONLINK } else { 0 },
     };
     let rtm_off = mem::size_of::<libc::nlmsghdr>();
     buf[rtm_off..rtm_off + mem::size_of_val(&rtm)].copy_from_slice(struct_as_bytes(&rtm));
@@ -457,10 +460,99 @@ fn handle_dhcp_ack(nl_sock: libc::c_int, iface_index: i32, response: &[u8]) -> a
 
     mod_addr4(nl_sock, iface_index, libc::RTM_NEWADDR, addr, prefix_len)
         .context("add address from DHCP")?;
-    mod_route4(nl_sock, iface_index, libc::RTM_NEWROUTE, router)
+    mod_route4(nl_sock, iface_index, libc::RTM_NEWROUTE, router, false)
         .context("add default route from DHCP")?;
     let _ = set_mtu(nl_sock, iface_index, mtu as u32);
 
+    Ok(())
+}
+
+fn route_socket() -> anyhow::Result<OwnedFd> {
+    let raw = Errno::result(unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        )
+    })
+    .context("socket(AF_NETLINK)")?;
+    let sock = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut addr: libc::sockaddr_nl = unsafe { mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    Errno::result(unsafe {
+        libc::bind(
+            sock.as_raw_fd(),
+            (&addr as *const libc::sockaddr_nl).cast(),
+            mem::size_of_val(&addr) as libc::socklen_t,
+        )
+    })
+    .context("bind(netlink)")?;
+    Ok(sock)
+}
+
+/// The cold-boot VMM supplies the Worker lease as `address/prefix,gateway[,dns]`.
+pub fn configure_static_ipv4(iface: &str, sock: i32, value: &str) -> anyhow::Result<()> {
+    let mut fields = value.split(',');
+    let report = || anyhow::anyhow!("invalid static IPv4 boot configuration");
+    let (ip, prefix) = fields
+        .next()
+        .and_then(|v| v.split_once('/'))
+        .ok_or_else(report)?;
+    let ip = ip.parse::<Ipv4Addr>().map_err(|_| report())?;
+    let prefix = prefix.parse::<u8>().map_err(|_| report())?;
+    let gateway = fields
+        .next()
+        .and_then(|v| v.parse::<Ipv4Addr>().ok())
+        .ok_or_else(report)?;
+    let dns = fields
+        .next()
+        .map(|v| v.parse::<Ipv4Addr>().map_err(|_| report()))
+        .transpose()?;
+    if !ip.is_private()
+        || !gateway.is_private()
+        || ip == gateway
+        || !(1..=32).contains(&prefix)
+        || dns.is_some_and(|v| !v.is_private())
+        || fields.next().is_some()
+    {
+        return Err(report());
+    }
+    let iface_index = if_::if_nametoindex(iface).context("locate static IPv4 uplink")?;
+    let mut ifr: libc::ifreq = unsafe { mem::zeroed() };
+    for (byte, slot) in iface.bytes().zip(&mut ifr.ifr_name) {
+        *slot = byte as libc::c_char;
+    }
+    unsafe {
+        Errno::result(libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut ifr))
+            .context("read static IPv4 uplink flags")?;
+        ifr.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
+        Errno::result(libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr))
+            .context("bring up static IPv4 uplink")?;
+    }
+    let netlink = route_socket()?;
+    mod_addr4(
+        netlink.as_raw_fd(),
+        iface_index as i32,
+        libc::RTM_NEWADDR,
+        u32::from_ne_bytes(ip.octets()),
+        prefix,
+    )
+    .context("install static IPv4 address")?;
+    // Native assigns one /32 to each isolated guest port. The Worker gateway
+    // is reached on that link even though its address is outside the prefix.
+    mod_route4(
+        netlink.as_raw_fd(),
+        iface_index as i32,
+        libc::RTM_NEWROUTE,
+        u32::from_ne_bytes(gateway.octets()),
+        prefix == 32,
+    )
+    .context("install static IPv4 default route")?;
+    if let Some(dns) = dns {
+        if let Err(e) = std::fs::write("/etc/resolv.conf", format!("nameserver {dns}\n")) {
+            eprintln!("Warning: couldn't write /etc/resolv.conf: {e}");
+        }
+    }
     Ok(())
 }
 
@@ -481,24 +573,7 @@ fn handle_dhcp_ack(nl_sock: libc::c_int, iface_index: i32, response: &[u8]) -> a
 pub fn do_dhcp(iface: &str) -> anyhow::Result<()> {
     let iface_index =
         if_::if_nametoindex(iface).with_context(|| format!("if_nametoindex({iface})"))?;
-
-    let raw = Errno::result(unsafe {
-        libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE)
-    })
-    .context("socket(AF_NETLINK)")?;
-    let nl_sock = unsafe { OwnedFd::from_raw_fd(raw) };
-
-    let mut nl_sa: libc::sockaddr_nl = unsafe { mem::zeroed() };
-    nl_sa.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-    nl_sa.nl_pid = unistd::getpid().as_raw() as u32;
-    Errno::result(unsafe {
-        libc::bind(
-            nl_sock.as_raw_fd(),
-            &nl_sa as *const _ as *const libc::sockaddr,
-            mem::size_of_val(&nl_sa) as u32,
-        )
-    })
-    .context("bind(netlink)")?;
+    let nl_sock = route_socket()?;
 
     // Send Request (DHCPDISCOVER)
     let sock = socket::socket(
