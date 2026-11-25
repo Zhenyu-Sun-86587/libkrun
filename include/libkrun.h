@@ -322,6 +322,16 @@ int32_t krun_configure_worker_block_pivot_v1(uint32_t ctx_id,
 int32_t krun_configure_worker_block_restore_v1(uint32_t ctx_id,
                                               const uint8_t *config,
                                               size_t config_len);
+
+/* Attach a prepared durable StatePoint and its regular-file RAM lease. This
+ * UTF-8 JSON contains operation_id, request_digest, capture_id, lease_id and
+ * optional volume_restore_policy (exact or clone_conflicts).
+ * Configure the Worker endpoint first, then use an authorized parked identity
+ * context and its exact disk generation grant when entering the VMM.
+ */
+int32_t krun_configure_worker_statepoint_restore_v1(uint32_t ctx_id,
+                                                   const uint8_t *config,
+                                                   size_t config_len);
 #endif
 #endif
 

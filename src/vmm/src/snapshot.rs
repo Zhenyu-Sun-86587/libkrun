@@ -693,7 +693,7 @@ fn unsupported_seal_query(error: &io::Error) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn copy_file_extents(
+pub(crate) fn copy_file_extents(
     backing: &File,
     backing_start: u64,
     len: u64,
@@ -777,7 +777,7 @@ fn copy_file_extents(
 }
 
 #[cfg(target_os = "linux")]
-fn copy_file_range_sparse(
+pub(crate) fn copy_file_range_sparse(
     source: &File,
     source_offset: u64,
     len: u64,

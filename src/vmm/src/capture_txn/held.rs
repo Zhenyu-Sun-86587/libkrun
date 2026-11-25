@@ -55,6 +55,7 @@ pub(super) struct Capture {
     point: Option<Arc<HeldExport>>,
     writers: Vec<ParkedWriter>,
     writers_committed: bool,
+    stop_reserved: bool,
     error: Option<String>,
 }
 
@@ -91,7 +92,8 @@ impl Capture {
             "OK {}\n",
             json!({"protocol":"CaptureControl/1", "mode": if self.managed {"parked"} else {"raw"},
           "session":self.token.session, "hold_token":format!("{:032x}",self.token.nonce),
-          "phase":phase,"source_disposition":disposition, "clone_ready":false, "error":self.error})
+          "phase":phase,"source_disposition":disposition, "clone_ready":false, "error":self.error,
+          "from_standby":self.from_standby,"stop_reserved":self.stop_reserved})
         )
     }
 }
@@ -384,7 +386,14 @@ impl Vmm {
         let (token, fields) = Token::parse(arguments)?;
         match (verb, fields.as_slice()) {
             ("CAPTURE_PREPARE", ["raw" | "parked"])
-            | ("CAPTURE_QUERY" | "CAPTURE_CANCEL", [])
+            | (
+                "CAPTURE_QUERY"
+                | "CAPTURE_CANCEL"
+                | "CAPTURE_DROP_EXPORT"
+                | "CAPTURE_STOP_RESERVE"
+                | "CAPTURE_STOP_UNRESERVE",
+                [],
+            )
             | ("CAPTURE_FINISH", ["CONTINUE" | "KEEP_HELD" | "RETURN_STANDBY"]) => (),
             _ => return Err("EINVAL invalid held capture parameters or source disposition".into()),
         }
@@ -454,6 +463,7 @@ impl Vmm {
                     Vec::new()
                 },
                 writers_committed: false,
+                stop_reserved: false,
                 error: None,
             });
             if !from_standby && let Err(e) = self.pause() {
@@ -481,9 +491,32 @@ impl Vmm {
             return Err("ESTALE unknown capture session".into());
         } else if verb == "CAPTURE_PREPARE" && current.unwrap().managed != (fields == ["parked"]) {
             return Err("EINVAL capture mode differs from original request".into());
+        } else if verb == "CAPTURE_DROP_EXPORT" {
+            let record = self.capture_control.capture.as_mut().unwrap();
+            if !record.managed
+                || !matches!(
+                    record.phase,
+                    Phase::Held | Phase::Finished | Phase::ReturnedStandby | Phase::Thawing
+                )
+            {
+                return Err("EBUSY no stable parked capture export to drop".into());
+            }
+            record.point = None;
+        } else if matches!(verb, "CAPTURE_STOP_RESERVE" | "CAPTURE_STOP_UNRESERVE") {
+            let record = self.capture_control.capture.as_mut().unwrap();
+            if !record.managed
+                || record.phase != Phase::Held
+                || (!record.writers.is_empty() && !record.writers_committed)
+            {
+                return Err("EBUSY stop requires the current complete parked capture".into());
+            }
+            record.stop_reserved = verb == "CAPTURE_STOP_RESERVE";
         } else if matches!(verb, "CAPTURE_FINISH" | "CAPTURE_CANCEL") {
             let record = self.capture_control.capture.as_ref().unwrap();
             let cancelled = verb == "CAPTURE_CANCEL";
+            if record.stop_reserved && fields != ["KEEP_HELD"] {
+                return Err("EBUSY the Worker reserved this capture for stop".into());
+            }
             if !record.writers.is_empty()
                 && !cancelled
                 && fields != ["KEEP_HELD"]

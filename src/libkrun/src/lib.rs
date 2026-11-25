@@ -229,6 +229,13 @@ struct ContextConfig {
         feature = "blk",
         not(feature = "tee")
     ))]
+    worker_statepoint: Option<worker_pivot::PreparedStatePoint>,
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
     target_authority: Option<std::os::unix::net::UnixDatagram>,
     vsock_config: VsockConfig,
     #[cfg(feature = "blk")]
@@ -1750,19 +1757,28 @@ fn layered_restore_ctx(
     directory: &std::path::Path,
     generation: vmm::layered_restore::Generation,
 ) -> std::result::Result<vmm::builder::RestoreCtx, String> {
+    let checkpoint = std::fs::read(directory.join("checkpoint.bin"))
+        .map_err(|error| format!("checkpoint: {error}"))?;
+    layered_restore_state(generation, checkpoint, false)
+}
+
+#[cfg(all(target_os = "linux", fork_supported))]
+fn layered_restore_state(
+    generation: vmm::layered_restore::Generation,
+    checkpoint: Vec<u8>,
+    portable_clock: bool,
+) -> std::result::Result<vmm::builder::RestoreCtx, String> {
     let guest_memory = generation
         .restore()
         .map_err(|error| format!("map layered RAM: {error}"))?;
     let count = generation.memory_regions().len();
-    let checkpoint = std::fs::read(directory.join("checkpoint.bin"))
-        .map_err(|error| format!("checkpoint: {error}"))?;
     Ok(vmm::builder::RestoreCtx {
         demand_pager: None,
         layered_ram: Some(generation),
         guest_memory,
         fork_backed_regions: vec![true; count],
         checkpoint,
-        portable_clock: false,
+        portable_clock,
         cow_backing: Vec::new(),
     })
 }
@@ -2114,6 +2130,9 @@ fn handle_control_stream(
                         | "CAPTURE_EXPORT"
                         | "CAPTURE_FINISH"
                         | "CAPTURE_CANCEL"
+                        | "CAPTURE_DROP_EXPORT"
+                        | "CAPTURE_STOP_RESERVE"
+                        | "CAPTURE_STOP_UNRESERVE"
                         | "CAPTURE_BLOCK_PIVOT"
                         | "CAPTURE_BLOCK_PIVOT_ABORT"
                         | "STANDBY_ENTER"
@@ -2168,7 +2187,13 @@ fn handle_control_stream(
                     feature = "blk",
                     not(feature = "tee")
                 ))]
-                "CAPTURE_PREPARE" | "CAPTURE_QUERY" | "CAPTURE_FINISH" | "CAPTURE_CANCEL" => vmm
+                "CAPTURE_PREPARE"
+                | "CAPTURE_QUERY"
+                | "CAPTURE_FINISH"
+                | "CAPTURE_CANCEL"
+                | "CAPTURE_DROP_EXPORT"
+                | "CAPTURE_STOP_RESERVE"
+                | "CAPTURE_STOP_UNRESERVE" => vmm
                     .lock()
                     .unwrap()
                     .held_capture_control(&verb, _arg)
@@ -6440,10 +6465,23 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         feature = "blk",
         not(feature = "tee")
     ))]
-    if parked_target && (ctx_cfg.snapshot_dir.is_none() || ctx_cfg.diskless_snapshot_ram.is_none())
     {
-        set_last_error("parked target requires its retained capture and RAM generation");
-        return -libc::EINVAL;
+        let durable = ctx_cfg.worker_statepoint.is_some();
+        if (parked_target
+            && !durable
+            && (ctx_cfg.snapshot_dir.is_none() || ctx_cfg.diskless_snapshot_ram.is_none()))
+            || (durable
+                && (!parked_target
+                    || ctx_cfg.snapshot_dir.is_some()
+                    || ctx_cfg.diskless_snapshot_ram.is_some()
+                    || ctx_cfg.snapshot_memory.is_some()
+                    || !ctx_cfg.block_cfgs.is_empty()))
+        {
+            set_last_error(
+                "parked target requires one complete retained or durable StatePoint and its identity authority",
+            );
+            return -libc::EINVAL;
+        }
     }
     #[cfg(all(target_os = "linux", fork_supported, feature = "blk"))]
     if ctx_cfg.diskless_snapshot_ram.is_some()
@@ -6602,6 +6640,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                                 ctx_cfg.worker_restore.as_ref(),
                                 &ctx_cfg.vmr,
                                 &state,
+                                None,
                             )?;
                     }
                     if !parked_target
@@ -6643,7 +6682,53 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                 }
             }
         }
-        None => None,
+        None => {
+            #[cfg(all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                feature = "blk",
+                not(feature = "tee")
+            ))]
+            let result =
+                if let Some(prepared) = ctx_cfg.worker_statepoint.take() {
+                    match (|| {
+                        prepared.verify_read_only_disks(&ctx_cfg.vmr)?;
+                        if ctx_cfg.worker_restore.as_ref().is_some_and(|scope| {
+                            scope.source_pivot_id != prepared.source_operation_id
+                        }) {
+                            return Err(
+                                "StatePoint does not belong to the authorized disk capture".into(),
+                            );
+                        }
+                        let state = vmm::VmCheckpoint::deserialize(&prepared.checkpoint)?;
+                        ctx_cfg.vmr.guest_target_writers_verified =
+                            worker_pivot::validate_parked_restore(
+                                ctx_cfg.worker_pivot.as_ref(),
+                                ctx_cfg.worker_restore.as_ref(),
+                                &ctx_cfg.vmr,
+                                &state,
+                                Some(&prepared.lease_id),
+                            )?;
+                        layered_restore_state(prepared.generation, prepared.checkpoint, true)
+                    })() {
+                        Ok(restore) => Some(restore),
+                        Err(error) => {
+                            set_last_error(format!("restore durable StatePoint: {error}"));
+                            return -libc::EINVAL;
+                        }
+                    }
+                } else {
+                    None
+                };
+            #[cfg(not(all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                feature = "blk",
+                not(feature = "tee")
+            )))]
+            let result = None;
+            result
+        }
     };
     #[cfg(not(fork_supported))]
     let restore_ctx: Option<vmm::builder::RestoreCtx> = None;
