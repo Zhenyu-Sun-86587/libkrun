@@ -38,3 +38,20 @@ failure leaves it held. A stale token and an unscoped legacy RESUME are both
 rejected. On a two-second hold, all three Guest counters and a raw disk
 counter remained fixed, then advanced after wake. The test also checks that
 the Guest monotonic clock excludes the pause.
+
+Use `--capture` to exercise the native raw capture control socket. A nonzero
+session number and a random 128-bit token identify one transaction. Prepare
+pauses the vCPUs, drains devices, records CPU, VM and device state, and seals
+the source RAM in place. A subsequent capture retains the base files and
+records private dirty pages as immutable delta files. The raw receipt has
+`clone_ready=false` because mutable disk and external attachments are visible
+in its inventory and require separate resource authority.
+
+The prepare command takes `<session> <token> raw`. Query, export and cancel
+take the same session and token. Finish additionally accepts `KEEP_HELD` or
+`CONTINUE`. A partially transferred export can be retried. The success line
+declares the lengths of the binary checkpoint and JSON RAM descriptor, followed
+by those two payloads and one SCM_RIGHTS message per sorted backing ID.
+The test closes a connection during transfer, compares repeated exports down
+to their inode numbers and seals, and checks that a cancelled capture can no
+longer be exported. An incomplete remap or capture remains held for diagnosis.
