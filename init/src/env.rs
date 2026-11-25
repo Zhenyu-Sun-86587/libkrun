@@ -12,14 +12,18 @@ use nix::errno::Errno;
 use nix::sys::socket::{self, AddressFamily, SockFlag, SockType};
 
 #[cfg(target_os = "linux")]
-pub fn setup_network(iface: &str) {
+pub fn setup_network(iface: &str) -> anyhow::Result<()> {
     let Ok(sock) = socket::socket(
         AddressFamily::Inet,
         SockType::Datagram,
         SockFlag::empty(),
         None,
     ) else {
-        return;
+        // A managed static attachment must be configured before the workload.
+        if env::var_os("KRUN_STATIC_IPV4").is_some() {
+            anyhow::bail!("cannot open socket for static IPv4 configuration");
+        }
+        return Ok(());
     };
     let mut ifr: libc::ifreq = unsafe { mem::zeroed() };
     let lo = c"lo";
@@ -33,7 +37,15 @@ pub fn setup_network(iface: &str) {
         libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFFLAGS as _, &ifr);
     }
 
-    setup_dhcp(iface, sock.as_raw_fd());
+    if let Some(network) = env::var_os("KRUN_STATIC_IPV4") {
+        let value = network
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid static IPv4 configuration"))?;
+        crate::dhcp::configure_static_ipv4(iface, sock.as_raw_fd(), value)?;
+    } else {
+        setup_dhcp(iface, sock.as_raw_fd());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "freebsd")]

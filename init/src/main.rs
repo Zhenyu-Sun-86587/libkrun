@@ -80,10 +80,10 @@ fn main() -> anyhow::Result<()> {
         libc::setlogin(c"root".as_ptr())
     };
 
-    env::setup_network(
-        #[cfg(target_os = "linux")]
-        "eth0",
-    );
+    #[cfg(target_os = "linux")]
+    env::setup_network("eth0")?;
+    #[cfg(not(target_os = "linux"))]
+    env::setup_network();
 
     #[cfg(target_os = "linux")]
     if env::tsi_enabled() {
