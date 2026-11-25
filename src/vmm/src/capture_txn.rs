@@ -27,6 +27,8 @@ pub(crate) struct DeviceInfo {
     negotiated_features: u64,
     pub quiesce_supported: bool,
     pub block: Option<BlockInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bootstrap_init_sha256: Option<String>,
 }
 
 impl DeviceInfo {
@@ -68,6 +70,12 @@ impl DeviceInfo {
             offered_features: dev.avail_features(),
             negotiated_features: dev.acked_features(),
             quiesce_supported,
+            #[cfg(not(feature = "aws-nitro"))]
+            bootstrap_init_sha256: concrete
+                .downcast_ref::<devices::virtio::Fs>()
+                .and_then(|fs| fs.block_bootstrap_digest()),
+            #[cfg(feature = "aws-nitro")]
+            bootstrap_init_sha256: None,
             block: block.map(|b| BlockInfo {
                 capacity_bytes: b.capacity_bytes(),
                 read_only: b.is_read_only(),
@@ -101,10 +109,14 @@ pub(super) struct CaptureControl {
 
 impl Vmm {
     pub fn deep_control_holds_vmm(&self) -> bool {
-        self.capture_control
-            .capture
+        self.guest_gate
             .as_ref()
-            .is_some_and(held::Capture::holds_vmm)
+            .is_some_and(|g| g.lock().unwrap().target_quarantined())
+            || self
+                .capture_control
+                .capture
+                .as_ref()
+                .is_some_and(held::Capture::holds_vmm)
             || self
                 .capture_control
                 .standby

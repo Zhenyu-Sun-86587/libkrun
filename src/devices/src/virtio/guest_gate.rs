@@ -6,6 +6,9 @@ use super::{
 };
 use vm_memory::GuestMemoryMmap;
 
+mod target;
+pub use target::{ParkedState, TargetScope};
+
 pub const DEVICE_TYPE: u32 = 0xff51;
 const COMMAND_BYTES: usize = 36;
 const RESPONSE_BYTES: usize = 28;
@@ -14,6 +17,10 @@ const RESPONSE_BYTES: usize = 28;
 enum Phase {
     Preparing,
     Armed,
+    Applying,
+    IdentityReady,
+    Activating,
+    FailedHeld,
     Parking,
     Parked,
     Releasing,
@@ -37,6 +44,10 @@ impl Phase {
         match self {
             Self::Preparing => "preparing",
             Self::Armed => "armed",
+            Self::Applying => "applying",
+            Self::IdentityReady => "identity_ready",
+            Self::Activating => "activating",
+            Self::FailedHeld => "failed_held",
             Self::Parking => "parking",
             Self::Parked => "parked",
             Self::Releasing => "releasing",
@@ -61,6 +72,11 @@ struct Session {
 
 pub struct GuestGate {
     helper_digest: Option<[u8; 32]>,
+    target_scope: Option<TargetScope>,
+    target_bound: bool,
+    target_done: bool,
+    identity_frame: [u8; 192],
+    request_digest: Option<[u8; 32]>,
     anchor: [u8; 16],
     features: u64,
     interrupt: Option<InterruptTransport>,
@@ -73,6 +89,11 @@ impl Default for GuestGate {
     fn default() -> Self {
         Self {
             helper_digest: None,
+            target_scope: None,
+            target_bound: false,
+            target_done: false,
+            identity_frame: [0; 192],
+            request_digest: None,
             anchor: [0; 16],
             features: 0,
             interrupt: None,
@@ -89,6 +110,10 @@ impl GuestGate {
             helper_digest,
             ..Self::default()
         }
+    }
+
+    pub fn provision_target(&mut self, scope: Option<TargetScope>) {
+        self.target_scope = scope;
     }
 
     pub fn parked(&self, number: u32, nonce: u128) -> bool {
@@ -129,6 +154,9 @@ impl GuestGate {
     }
 
     pub fn control(&mut self, verb: &str, arguments: &str) -> Result<String, &'static str> {
+        if self.target_scope.is_some() && !self.target_done {
+            return Err("EPERM target requires its private host authority");
+        }
         let mut fields = arguments.split_ascii_whitespace();
         let number = fields
             .next()
@@ -258,6 +286,9 @@ impl GuestGate {
         let next = match (s.phase, status, error) {
             (Phase::Preparing, 1, 0) => Phase::Armed,
             (Phase::Parking, 6, 0) => Phase::Parked,
+            (Phase::Applying, 7, 0) => Phase::IdentityReady,
+            (Phase::Applying | Phase::Activating, 8, e) if e < 0 => Phase::FailedHeld,
+            (Phase::Activating, 2, 0) => Phase::Released,
             (Phase::Releasing, 2, 0) => Phase::Released,
             (Phase::Aborting, 3, 0) => Phase::Aborted,
             (
@@ -280,6 +311,12 @@ impl GuestGate {
             ) if e < 0 => Phase::FailedThawed,
             _ => return,
         };
+        if matches!(next, Phase::IdentityReady | Phase::FailedHeld) {
+            self.identity_frame[64..].fill(0);
+        }
+        if s.phase == Phase::Activating && next == Phase::Released {
+            self.target_done = true;
+        }
         s.phase = next;
         s.error = error;
     }
@@ -311,6 +348,16 @@ impl VirtioDevice for GuestGate {
         let Some(end) = index.checked_add(data.len()) else {
             return;
         };
+        if (112..304).contains(&index) && end <= 304 {
+            if self
+                .session
+                .as_ref()
+                .is_some_and(|s| s.phase == Phase::Applying)
+            {
+                data.copy_from_slice(&self.identity_frame[index - 112..end - 112]);
+            }
+            return;
+        }
         if (96..112).contains(&index) && end <= 112 {
             data.copy_from_slice(&self.anchor[index - 96..end - 96]);
             return;

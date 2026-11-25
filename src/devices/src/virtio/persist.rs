@@ -56,6 +56,8 @@ pub enum DeviceSnapshot {
     GuestGate {
         acked_features: u64,
     },
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    ParkedGuestGate(super::guest_gate::ParkedState),
 }
 
 impl DeviceSnapshot {
@@ -65,7 +67,7 @@ impl DeviceSnapshot {
         use crate::virtio::*;
         match self {
             #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
-            Self::GuestGate { .. } => guest_gate::DEVICE_TYPE,
+            Self::GuestGate { .. } | Self::ParkedGuestGate(_) => guest_gate::DEVICE_TYPE,
             #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
             DeviceSnapshot::Memory(_) => 24,
             DeviceSnapshot::Console(_) => TYPE_CONSOLE,
@@ -90,6 +92,8 @@ impl DeviceSnapshot {
         match self {
             #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
             Self::GuestGate { acked_features } => *acked_features,
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+            Self::ParkedGuestGate(s) => s.acked_features,
             #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
             DeviceSnapshot::Memory(s) => s.acked_features,
             DeviceSnapshot::Console(s) => s.acked_features,
@@ -114,7 +118,7 @@ impl DeviceSnapshot {
     pub fn queue_states(&self) -> Vec<Option<crate::virtio::queue::QueueState>> {
         match self {
             #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
-            Self::GuestGate { .. } => Vec::new(),
+            Self::GuestGate { .. } | Self::ParkedGuestGate(_) => Vec::new(),
             #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
             DeviceSnapshot::Memory(s) => vec![s.queue.clone()],
             DeviceSnapshot::Console(s) => s.queues.clone(),
@@ -222,6 +226,11 @@ pub fn snapshot_device(dev: &dyn VirtioDevice) -> Option<DeviceSnapshot> {
 pub fn restore_device(dev: &mut dyn VirtioDevice, snap: &DeviceSnapshot) -> Result<(), String> {
     let any = dev.as_mut_any();
     match snap {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        DeviceSnapshot::ParkedGuestGate(s) => any
+            .downcast_mut::<super::guest_gate::GuestGate>()
+            .ok_or("expected measured Guest gate")?
+            .bind_target(s),
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         DeviceSnapshot::GuestGate { .. } => {
             Err("Guest gate restore requires target activation authority".into())

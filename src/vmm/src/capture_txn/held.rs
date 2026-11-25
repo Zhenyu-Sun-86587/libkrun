@@ -39,10 +39,15 @@ enum Phase {
     FailedHeld,
     Unknown,
     FailedRunning,
+    Thawing,
+    ReturnedStandby,
 }
 
 pub(super) struct Capture {
     token: Token,
+    managed: bool,
+    from_standby: bool,
+    cancelled: bool,
     phase: Phase,
     point: Option<Arc<HeldExport>>,
     error: Option<String>,
@@ -50,20 +55,32 @@ pub(super) struct Capture {
 
 impl Capture {
     pub(super) fn holds_vmm(&self) -> bool {
-        matches!(self.phase, Phase::Held | Phase::FailedHeld | Phase::Unknown)
+        matches!(
+            self.phase,
+            Phase::Held | Phase::FailedHeld | Phase::Unknown | Phase::Thawing
+        )
     }
     fn receipt(&self) -> String {
         let (phase, disposition) = match self.phase {
             Phase::Held => ("prepared", "HELD"),
             Phase::Finished => ("finished", "RUNNING"),
             Phase::Cancelled => ("cancelled", "RUNNING"),
+            Phase::Thawing => ("finishing", "WAKING"),
+            Phase::ReturnedStandby => (
+                if self.cancelled {
+                    "cancelled"
+                } else {
+                    "finished"
+                },
+                "STANDBY",
+            ),
             Phase::FailedRunning => ("failed", "RUNNING"),
             Phase::FailedHeld => ("failed", "FAILED_HELD"),
             Phase::Unknown => ("failed", "UNKNOWN"),
         };
         format!(
             "OK {}\n",
-            json!({"protocol":"CaptureControl/1", "mode":"raw",
+            json!({"protocol":"CaptureControl/1", "mode": if self.managed {"parked"} else {"raw"},
           "session":self.token.session, "hold_token":format!("{:032x}",self.token.nonce),
           "phase":phase,"source_disposition":disposition, "clone_ready":false, "error":self.error})
         )
@@ -94,7 +111,95 @@ impl HeldExport {
 }
 
 impl Vmm {
-    fn capture_raw_boundary(&mut self, token: Token) -> Result<HeldExport, String> {
+    /// This first parked profile accepts an immutable block root and a small
+    /// set of local devices. Its Guest identity stage writes only to Guest RAM.
+    /// New device profiles must supply their own rebind and writer receipts.
+    fn parked_bindings(&self) -> Result<Vec<String>, String> {
+        use devices::virtio::{
+            TYPE_BALLOON, TYPE_BLOCK, TYPE_CONSOLE, TYPE_RNG, guest_gate::DEVICE_TYPE,
+        };
+        let mut bindings = Vec::new();
+        for dev in self.mmio_device_manager.capture_inventory()? {
+            let block = if dev.virtio_type == TYPE_BLOCK {
+                let spec = dev.block.ok_or("missing managed block")?;
+                let a = spec
+                    .managed_attachment
+                    .ok_or("unmanaged block in parked identity profile")?;
+                if !spec.read_only || a.writable_head_id.is_some() || a.layers.len() != 1 {
+                    return Err("parked target needs a fenced immutable disk closure".into());
+                }
+                json!([
+                    a.attachment_id,
+                    a.volume_id,
+                    a.generation_id,
+                    a.role,
+                    a.layers,
+                    spec.capacity_bytes
+                ])
+            } else if let Some(init) = dev.bootstrap_init_sha256 {
+                json!(["block-bootstrap", init])
+            } else if matches!(
+                dev.virtio_type,
+                TYPE_RNG | TYPE_CONSOLE | TYPE_BALLOON | DEVICE_TYPE
+            ) {
+                serde_json::Value::Null
+            } else {
+                return Err(format!(
+                    "device {} requires a rebind contract",
+                    dev.device_id
+                ));
+            };
+            bindings.push(
+                json!([
+                    dev.device_id,
+                    dev.virtio_type,
+                    dev.mmio_address,
+                    dev.irq,
+                    dev.offered_features,
+                    block
+                ])
+                .to_string(),
+            );
+        }
+        Ok(bindings)
+    }
+
+    pub(crate) fn validate_parked_target(&self, checkpoint: &VmCheckpoint) -> Result<(), String> {
+        use devices::virtio::persist::DeviceSnapshot;
+        let mut gates = checkpoint.devices.devices.iter().filter_map(|d| match d {
+            DeviceSnapshot::ParkedGuestGate(s) => Some(s),
+            _ => None,
+        });
+        let state = gates.next().ok_or("missing parked capture")?;
+        if gates.next().is_some()
+            || state.bindings != self.parked_bindings()?
+            || checkpoint.devices.devices.len() != state.bindings.len()
+        {
+            return Err("parked target device or immutable storage closure mismatch".into());
+        }
+        Ok(())
+    }
+
+    pub fn target_identity_request(&mut self, packet: &[u8]) -> Result<&'static str, String> {
+        let result = self
+            .guest_gate
+            .as_ref()
+            .ok_or("no Guest gate")?
+            .lock()
+            .unwrap()
+            .target_request(packet)
+            .map_err(str::to_owned)?;
+        if packet.first() == Some(&1)
+            && result == "applying"
+            && self.run_state == VmmRunState::Paused
+        {
+            self.resume()
+                .map_err(|e| format!("identity-stage resume: {e}"))?;
+        }
+        Ok(result)
+    }
+
+    fn capture_boundary(&mut self, token: Token, managed: bool) -> Result<HeldExport, String> {
         self.mmio_device_manager.quiesce_devices();
         self.devices_quiesced = true;
         self.mmio_device_manager.validate_standby_boundary()?;
@@ -103,7 +208,29 @@ impl Vmm {
         if vcpu_states.iter().any(|v| v.runs_nested_guest()) {
             return Err("nested KVM memory cannot form a sealed generation".into());
         }
-        let devices = self.snapshot_devices();
+        let mut devices = self.snapshot_devices();
+        if managed {
+            use devices::virtio::{guest_gate::ParkedState, persist::DeviceSnapshot};
+            let (anchor, helper) = self
+                .guest_gate
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .parked_identity()
+                .ok_or("measured gate lost its parked state")?;
+            let gate = devices
+                .devices
+                .iter_mut()
+                .find(|d| matches!(d, DeviceSnapshot::GuestGate { .. }))
+                .ok_or("missing parked Guest gate transport")?;
+            *gate = DeviceSnapshot::ParkedGuestGate(ParkedState {
+                acked_features: gate.acked_features(),
+                anchor,
+                helper,
+                bindings: self.parked_bindings()?,
+            });
+        }
         if devices.devices.len() != inventory.len() {
             return Err("incomplete device snapshot at capture boundary".into());
         }
@@ -149,7 +276,7 @@ impl Vmm {
             .map(|f| File::open(format!("/proc/self/fd/{}", f.as_raw_fd())))
             .collect::<io::Result<_>>()
             .map_err(|e| e.to_string())?;
-        let header=format!("OK {}\n",json!({"protocol":"CaptureControl/1", "export":"raw",
+        let header=format!("OK {}\n",json!({"protocol":"CaptureControl/1", "export": if managed {"parked"} else {"raw"},
            "session":token.session,"hold_token":format!("{:032x}",token.nonce),"clone_ready":false,
            "checkpoint_bytes":checkpoint.len(),"descriptor_bytes":descriptor.len(),"fd_count":backings.len(),
            "devices":inventory})).into_bytes();
@@ -164,9 +291,9 @@ impl Vmm {
     pub fn held_capture_control(&mut self, verb: &str, arguments: &str) -> Result<String, String> {
         let (token, fields) = Token::parse(arguments)?;
         match (verb, fields.as_slice()) {
-            ("CAPTURE_PREPARE", ["raw"])
+            ("CAPTURE_PREPARE", ["raw" | "parked"])
             | ("CAPTURE_QUERY" | "CAPTURE_CANCEL", [])
-            | ("CAPTURE_FINISH", ["CONTINUE" | "KEEP_HELD"]) => (),
+            | ("CAPTURE_FINISH", ["CONTINUE" | "KEEP_HELD" | "RETURN_STANDBY"]) => (),
             _ => return Err("EINVAL invalid held capture parameters or source disposition".into()),
         }
         let current = self.capture_control.capture.as_ref();
@@ -175,18 +302,38 @@ impl Vmm {
             if current.is_some_and(|c| c.token.session >= token.session) {
                 return Err("ESTALE stale capture session".into());
             }
-            if self.deep_control_holds_vmm() || self.run_state != VmmRunState::Running {
+            let managed = fields == ["parked"];
+            let from_standby = managed
+                && self.capture_control.standby.as_ref().is_some_and(|s| {
+                    s.managed
+                        && s.sequence == token.session
+                        && s.nonce == token.nonce
+                        && s.disposition == super::Disposition::Standby
+                });
+            if from_standby {
+                if self.run_state != VmmRunState::Paused
+                    || !self.devices_quiesced
+                    || current.is_some_and(Capture::holds_vmm)
+                {
+                    return Err("EBUSY standby has no stable device boundary".into());
+                }
+            } else if self.deep_control_holds_vmm() || self.run_state != VmmRunState::Running {
                 return Err("EBUSY VMM is already held".into());
             }
-            if !self
+            let gate = self
                 .guest_gate
                 .as_ref()
-                .ok_or("ENOTSUP native deep control was not provisioned")?
+                .ok_or("ENOTSUP native deep control is missing")?
                 .lock()
-                .unwrap()
-                .allows_raw_standby()
+                .unwrap();
+            if (managed && !gate.parked(token.session, token.nonce))
+                || (!managed && !gate.allows_raw_standby())
             {
-                return Err("EBUSY guest gate session is active".into());
+                return Err("EBUSY Guest gate differs from the requested capture mode".into());
+            }
+            drop(gate);
+            if managed {
+                self.parked_bindings().map_err(|e| format!("ENOTSUP {e}"))?;
             }
             self.raw_profile().map_err(|e| format!("ENOTSUP {e}"))?;
             if !self.has_layered_ram() {
@@ -200,11 +347,14 @@ impl Vmm {
             }
             self.capture_control.capture = Some(Capture {
                 token,
+                managed,
+                from_standby,
+                cancelled: false,
                 phase: Phase::Unknown,
                 point: None,
                 error: None,
             });
-            if let Err(e) = self.pause() {
+            if !from_standby && let Err(e) = self.pause() {
                 let running = self.run_state == VmmRunState::Running;
                 let record = self.capture_control.capture.as_mut().unwrap();
                 if running {
@@ -214,7 +364,7 @@ impl Vmm {
                 return Err(format!("EIO pause: {e}"));
             }
             self.capture_control.capture.as_mut().unwrap().phase = Phase::FailedHeld;
-            match self.capture_raw_boundary(token) {
+            match self.capture_boundary(token, managed) {
                 Ok(point) => {
                     let record = self.capture_control.capture.as_mut().unwrap();
                     record.point = Some(Arc::new(point));
@@ -227,28 +377,80 @@ impl Vmm {
             }
         } else if !matching {
             return Err("ESTALE unknown capture session".into());
+        } else if verb == "CAPTURE_PREPARE" && current.unwrap().managed != (fields == ["parked"]) {
+            return Err("EINVAL capture mode differs from original request".into());
         } else if matches!(verb, "CAPTURE_FINISH" | "CAPTURE_CANCEL") {
-            let phase = self.capture_control.capture.as_ref().unwrap().phase;
-            let decision = match (verb, fields.as_slice()) {
-                ("CAPTURE_CANCEL", _) => Phase::Cancelled,
-                (_, ["CONTINUE"]) => Phase::Finished,
-                _ => Phase::Held,
+            let record = self.capture_control.capture.as_ref().unwrap();
+            let cancelled = verb == "CAPTURE_CANCEL";
+            if (fields == ["RETURN_STANDBY"] && !record.from_standby)
+                || (fields == ["CONTINUE"] && record.from_standby)
+            {
+                return Err(
+                    "EINVAL source disposition conflicts with the original stable state".into(),
+                );
+            }
+            let decision = if fields == ["KEEP_HELD"] {
+                Phase::Held
+            } else if record.from_standby {
+                Phase::ReturnedStandby
+            } else if cancelled {
+                Phase::Cancelled
+            } else {
+                Phase::Finished
             };
-            if phase != decision {
-                if phase != Phase::Held {
+            let phase = record.phase;
+            if phase != Phase::Held {
+                if (phase != decision && phase != Phase::Thawing)
+                    || cancelled != record.cancelled
+                    || decision == Phase::Held
+                {
                     return Err("EBUSY capture decision cannot be changed".into());
                 }
-                self.capture_control.capture.as_mut().unwrap().phase = Phase::Unknown;
-                if let Err(e) = self.resume() {
-                    self.capture_control.capture.as_mut().unwrap().error = Some(e.to_string());
-                    return Err(format!("EIO resume: {e}"));
-                }
+            } else if decision != Phase::Held {
+                let managed = record.managed;
                 let record = self.capture_control.capture.as_mut().unwrap();
-                record.phase = decision;
-                if decision == Phase::Cancelled {
+                record.cancelled = cancelled;
+                if cancelled {
                     record.point = None;
                 }
+                if decision == Phase::ReturnedStandby {
+                    record.phase = decision;
+                } else {
+                    record.phase = Phase::Unknown;
+                    if managed {
+                        let arguments = format!("{} {:032x}", token.session, token.nonce);
+                        self.guest_gate
+                            .as_ref()
+                            .unwrap()
+                            .lock()
+                            .unwrap()
+                            .control("GUEST_GATE_RELEASE", &arguments)
+                            .map_err(str::to_owned)?;
+                    }
+                    if let Err(e) = self.resume() {
+                        self.capture_control.capture.as_mut().unwrap().error = Some(e.to_string());
+                        return Err(format!("EIO resume: {e}"));
+                    }
+                    self.capture_control.capture.as_mut().unwrap().phase =
+                        if managed { Phase::Thawing } else { decision };
+                }
             }
+        }
+        if self.capture_control.capture.as_ref().unwrap().phase == Phase::Thawing
+            && self
+                .guest_gate
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .source_released(token.session, token.nonce)
+        {
+            let record = self.capture_control.capture.as_mut().unwrap();
+            record.phase = if record.cancelled {
+                Phase::Cancelled
+            } else {
+                Phase::Finished
+            };
         }
         Ok(self.capture_control.capture.as_ref().unwrap().receipt())
     }
@@ -264,7 +466,12 @@ impl Vmm {
             .as_ref()
             .filter(|c| c.token == token)
             .ok_or("ESTALE unknown capture session")?;
-        if !matches!(capture.phase, Phase::Held | Phase::Finished) {
+        if capture.cancelled
+            || !matches!(
+                capture.phase,
+                Phase::Held | Phase::Finished | Phase::ReturnedStandby
+            )
+        {
             return Err("EBUSY capture is unavailable".into());
         }
         capture

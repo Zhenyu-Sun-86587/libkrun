@@ -1253,6 +1253,14 @@ int32_t krun_set_control_socket(uint32_t ctx_id, const char *c_socket_path);
 /* Attach the managed Guest freezer mailbox (Linux x86-64) before boot. */
 int32_t krun_enable_guest_gate_v1(uint32_t ctx_id);
 
+/* Linux x86_64 managed restore. Configure the measured helper first. Bind
+ * this target to a parked capture and a fresh execution/attachment digest.
+ * The library duplicates the connected AF_UNIX SOCK_SEQPACKET endpoint.
+ * Its peer supplies identity and a separate activation decision. */
+int32_t krun_set_guest_target_authority_v1(uint32_t ctx_id, int fd,
+                                         const uint8_t anchor[16],
+                                         const uint8_t context_digest[32], uint64_t epoch);
+
 /* Require the measured static helper before freezing Guest userspace. */
 int32_t krun_set_guest_identity_helper_v1(uint32_t ctx_id, const uint8_t *digest, size_t length);
 
