@@ -398,6 +398,53 @@ impl MMIODeviceManager {
         None
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    pub(crate) fn capture_inventory(
+        &self,
+    ) -> std::result::Result<Vec<crate::capture_txn::DeviceInfo>, String> {
+        let mut inventory = Vec::new();
+        for ((kind, id), slot) in &self.id_to_dev_info {
+            #[allow(irrefutable_let_patterns)]
+            let DeviceType::Virtio(kind) = kind else {
+                continue;
+            };
+            let (_, bus_device) = self
+                .bus
+                .get_device(slot.addr)
+                .ok_or_else(|| format!("missing registered MMIO device {id}"))?;
+            let transport = self
+                .mmio_transports
+                .iter()
+                .find(|transport| {
+                    std::ptr::addr_eq(
+                        std::ptr::from_ref(transport.as_ref()),
+                        std::ptr::from_ref(bus_device),
+                    )
+                })
+                .ok_or_else(|| format!("missing virtio transport for {id}"))?;
+            let transport = transport.lock().unwrap();
+            let dev = transport.locked_device();
+            if dev.device_type() != *kind {
+                return Err(format!("virtio type mismatch for {id}"));
+            }
+            inventory.push(crate::capture_txn::DeviceInfo::from_device(
+                id, slot.addr, slot._irq, &*dev,
+            )?);
+        }
+        if inventory.len() != self.mmio_transports.len()
+            || inventory.len() != self.virtio_devices.len()
+        {
+            return Err("incomplete registered virtio inventory".into());
+        }
+        inventory.sort_by_key(|dev| dev.mmio_address);
+        Ok(inventory)
+    }
+
     /// Capture the runtime state of every snapshot-supporting virtio device
     /// for VM checkpoint/fork, aggregating per-device snapshots via
     /// [`VmDevicesState::capture`]. Iterates the device handles kept at
@@ -542,6 +589,30 @@ impl MMIODeviceManager {
     pub fn validate_snapshot_boundary(&self) -> std::result::Result<(), String> {
         for dev in &self.virtio_devices {
             let guard = dev.lock().expect("poisoned virtio device lock");
+            if let Some(error) = guard.snapshot_error() {
+                return Err(format!("{}: {error}", guard.device_name()));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    pub(crate) fn validate_standby_boundary(&self) -> std::result::Result<(), String> {
+        for dev in &self.virtio_devices {
+            let guard = dev.lock().unwrap();
+            // The queue-less freezer mailbox has no Guest-memory writers. Its
+            // snapshot error prevents exporting a source mailbox to a target.
+            if guard
+                .as_any()
+                .is::<devices::virtio::guest_gate::GuestGate>()
+            {
+                continue;
+            }
             if let Some(error) = guard.snapshot_error() {
                 return Err(format!("{}: {error}", guard.device_name()));
             }

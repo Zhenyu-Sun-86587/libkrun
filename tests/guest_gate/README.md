@@ -28,3 +28,13 @@ then observes all three advance after each source thaw.
 cc -static -O2 -Wall -Wextra -Werror tests/guest_gate/counters.c -o /tmp/gate-counters
 LD_LIBRARY_PATH="$FIRMWARE_DIR" python3 tests/guest_gate/probe.py "$LIBKRUN_SO" /tmp/gate-counters
 ```
+
+The `--standby` option attaches a writable disk and a read-only disk. It checks
+`CAPTURE_INVENTORY` against their names, capacities and access modes, and
+uses `STANDBY_ENTER <session> <nonce> raw`, `STANDBY_QUERY` and
+`STANDBY_WAKE`. The enter response records `clone_ready=false`. This path
+holds the vCPUs and drains the device workers in the current VMM. Device drain
+failure leaves it held. A stale token and an unscoped legacy RESUME are both
+rejected. On a two-second hold, all three Guest counters and a raw disk
+counter remained fixed, then advanced after wake. The test also checks that
+the Guest monotonic clock excludes the pause.

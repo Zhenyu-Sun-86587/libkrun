@@ -728,6 +728,11 @@ impl Block {
         &self.id
     }
 
+    /// Capacity currently exposed through the virtio config space.
+    pub fn capacity_bytes(&self) -> u64 {
+        self.config.capacity * SECTOR_SIZE
+    }
+
     /// Grow an exclusively owned writable disk and notify the guest driver.
     /// The caller must serialize this with snapshots and backing-layer pivots,
     /// and must never use it on an immutable ancestor of another machine.

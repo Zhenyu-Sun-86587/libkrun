@@ -7,13 +7,17 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 static int count(void *arg)
 {
     unsigned int index = *(const unsigned int *)arg;
-    uint64_t value = 0;
+    struct { uint64_t count, monotonic_ns; } sample = {0};
+    struct timespec clock;
+    int disk = -1;
     cpu_set_t cpus;
     char path[64];
     int fd;
@@ -26,9 +30,25 @@ static int count(void *arg)
     fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0)
         return 1;
+    if (index == 0) {
+        char marker[sizeof("smolvm-standby-test")];
+        int probe = open("/dev/vda", O_RDWR | O_CLOEXEC);
+        if (probe >= 0) {
+            if (pread(probe, marker, sizeof(marker), 0) == sizeof(marker) &&
+                memcmp(marker, "smolvm-standby-test", sizeof(marker)) == 0)
+                disk = probe;
+            else
+                close(probe);
+        }
+    }
     for (;;) {
-        value++;
-        if (pwrite(fd, &value, sizeof(value), 0) != sizeof(value) || fdatasync(fd) < 0)
+        sample.count++;
+        if (clock_gettime(CLOCK_MONOTONIC, &clock) < 0)
+            return 1;
+        sample.monotonic_ns = (uint64_t)clock.tv_sec * 1000000000 + clock.tv_nsec;
+        if (disk >= 0 && (pwrite(disk, &sample.count, 8, 512) != 8 || fdatasync(disk) < 0))
+            return 1;
+        if (pwrite(fd, &sample, sizeof(sample), 0) != sizeof(sample) || fdatasync(fd) < 0)
             return 1;
         usleep(20000);
     }
