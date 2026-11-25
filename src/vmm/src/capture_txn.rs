@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Native control for one live deep VMM. The VMM mutex serializes decisions.
 use crate::{Vmm, VmmRunState};
+use devices::virtio::block::managed::ManagedAttachment;
 use devices::virtio::{Balloon, Block, Console, Rng, VirtioDevice, Vsock, guest_gate::GuestGate};
 use serde::Serialize;
+
+mod held;
 
 #[derive(Serialize)]
 pub(crate) struct BlockInfo {
     capacity_bytes: u64,
     read_only: bool,
+    managed_attachment: Option<ManagedAttachment>,
 }
 
 #[derive(Serialize)]
@@ -67,6 +71,7 @@ impl DeviceInfo {
             block: block.map(|b| BlockInfo {
                 capacity_bytes: b.capacity_bytes(),
                 read_only: b.is_read_only(),
+                managed_attachment: b.managed_attachment().cloned(),
             }),
         })
     }
@@ -89,14 +94,20 @@ struct StandbyReceipt {
 #[derive(Default)]
 pub(super) struct CaptureControl {
     standby: Option<StandbyReceipt>,
+    capture: Option<held::Capture>,
 }
 
 impl Vmm {
     pub fn deep_control_holds_vmm(&self) -> bool {
         self.capture_control
-            .standby
+            .capture
             .as_ref()
-            .is_some_and(|s| s.disposition != Disposition::Running)
+            .is_some_and(held::Capture::holds_vmm)
+            || self
+                .capture_control
+                .standby
+                .as_ref()
+                .is_some_and(|s| s.disposition != Disposition::Running)
     }
 
     fn raw_profile(&self) -> Result<(), String> {
@@ -127,6 +138,15 @@ impl Vmm {
     pub fn standby_control(&mut self, verb: &str, arguments: &str) -> Result<String, String> {
         if self.guest_gate.is_none() {
             return Err("ENOTSUP native deep control was not provisioned".into());
+        }
+        if verb != "STANDBY_QUERY"
+            && self
+                .capture_control
+                .capture
+                .as_ref()
+                .is_some_and(held::Capture::holds_vmm)
+        {
+            return Err("EBUSY held capture owns the VMM".into());
         }
         let mut fields = arguments.split_ascii_whitespace();
         let sequence = fields

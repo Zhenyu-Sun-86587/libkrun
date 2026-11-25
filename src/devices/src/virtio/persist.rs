@@ -52,6 +52,10 @@ pub enum DeviceSnapshot {
     /// Distinct from legacy Net so an older reader refuses a broker-owned TAP.
     #[cfg(feature = "net")]
     TapNet(NetState),
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    GuestGate {
+        acked_features: u64,
+    },
 }
 
 impl DeviceSnapshot {
@@ -60,6 +64,8 @@ impl DeviceSnapshot {
     pub fn device_type(&self) -> u32 {
         use crate::virtio::*;
         match self {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+            Self::GuestGate { .. } => guest_gate::DEVICE_TYPE,
             #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
             DeviceSnapshot::Memory(_) => 24,
             DeviceSnapshot::Console(_) => TYPE_CONSOLE,
@@ -82,6 +88,8 @@ impl DeviceSnapshot {
     /// Negotiated feature bits to restore before re-activation.
     pub fn acked_features(&self) -> u64 {
         match self {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+            Self::GuestGate { acked_features } => *acked_features,
             #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
             DeviceSnapshot::Memory(s) => s.acked_features,
             DeviceSnapshot::Console(s) => s.acked_features,
@@ -105,6 +113,8 @@ impl DeviceSnapshot {
     /// transport's queues on re-activation.
     pub fn queue_states(&self) -> Vec<Option<crate::virtio::queue::QueueState>> {
         match self {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+            Self::GuestGate { .. } => Vec::new(),
             #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
             DeviceSnapshot::Memory(s) => vec![s.queue.clone()],
             DeviceSnapshot::Console(s) => s.queues.clone(),
@@ -159,6 +169,12 @@ impl VmDevicesState {
 /// device types without a snapshot impl yet.
 pub fn snapshot_device(dev: &dyn VirtioDevice) -> Option<DeviceSnapshot> {
     let any = dev.as_any();
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    if any.is::<super::guest_gate::GuestGate>() {
+        return Some(DeviceSnapshot::GuestGate {
+            acked_features: dev.acked_features(),
+        });
+    }
     #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
     if let Some(d) = any.downcast_ref::<MemoryDevice>() {
         return Some(DeviceSnapshot::Memory(d.save_state()));
@@ -206,6 +222,10 @@ pub fn snapshot_device(dev: &dyn VirtioDevice) -> Option<DeviceSnapshot> {
 pub fn restore_device(dev: &mut dyn VirtioDevice, snap: &DeviceSnapshot) -> Result<(), String> {
     let any = dev.as_mut_any();
     match snap {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        DeviceSnapshot::GuestGate { .. } => {
+            Err("Guest gate restore requires target activation authority".into())
+        }
         #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
         DeviceSnapshot::Memory(s) => any
             .downcast_mut::<MemoryDevice>()
