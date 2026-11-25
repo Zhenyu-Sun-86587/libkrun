@@ -523,6 +523,8 @@ struct PreparedSave {
     memory: vmm::snapshot::DeferredMemorySave,
 }
 
+#[cfg(all(target_os = "linux", feature = "blk", not(feature = "tee")))]
+mod managed_disks;
 #[cfg(all(snapshot_supported, deferred_stream_supported))]
 mod prepared_saves;
 
@@ -5577,7 +5579,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                     return -libc::EINVAL;
                 }
 
-                if ctx_cfg.block_cfgs.is_empty() {
+                if ctx_cfg.block_cfgs.is_empty() && ctx_cfg.vmr.block.list.is_empty() {
                     error!("No block devices configured");
                     return -libc::EINVAL;
                 }
@@ -6264,9 +6266,18 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         && (ctx_cfg.snapshot_dir.is_none()
             || ctx_cfg.snapshot_memory.is_some()
             || !ctx_cfg.block_cfgs.is_empty()
+            || !ctx_cfg.vmr.block.list.is_empty()
             || ctx_cfg.block_root.is_some())
     {
         set_last_error("detached RAM requires a snapshot directory and a diskless VM");
+        return -libc::EINVAL;
+    }
+
+    #[cfg(feature = "blk")]
+    if !ctx_cfg.vmr.block.list.is_empty()
+        && (!ctx_cfg.block_cfgs.is_empty() || ctx_cfg.snapshot_dir.is_some())
+    {
+        set_last_error("managed block attachments require a fully managed cold-boot context");
         return -libc::EINVAL;
     }
 
