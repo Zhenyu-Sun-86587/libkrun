@@ -38,6 +38,8 @@ pub mod layered_restore;
 mod memory_growth;
 /// Boot RAM geometry retained independently from added memory.
 pub mod memory_topology;
+#[cfg(all(target_os = "linux", feature = "blk"))]
+pub mod resource_export;
 /// Resource store for configured microVM resources.
 pub mod resources;
 #[cfg(target_os = "linux")]

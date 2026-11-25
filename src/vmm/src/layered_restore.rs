@@ -232,11 +232,7 @@ impl Generation {
                 .into_iter()
                 .collect();
             let files = crate::retained_fds::receive(&path, &token, pid, &keys)?;
-            Self::from_descriptions_with_files(
-                pid as i32,
-                &descriptions,
-                files.into_iter().collect(),
-            )?
+            Self::from_descriptions_with_files(None, &descriptions, files.into_iter().collect())?
         } else {
             Self::from_descriptions(pid as i32, &descriptions)?
         };
@@ -278,7 +274,7 @@ impl Generation {
         // rather than requiring broader access to the checkpoint cache.
         let files =
             std::collections::HashMap::from([(file.as_raw_fd(), Arc::new(file.try_clone()?))]);
-        Self::from_descriptions_with_files(std::process::id() as i32, &descriptions, files)
+        Self::from_descriptions_with_files(None, &descriptions, files)
     }
 
     /// Adopt a running source's own memfd regions as its first generation
@@ -317,22 +313,29 @@ impl Generation {
                 }],
             });
         }
-        Self::from_descriptions_with_files(std::process::id() as i32, &descriptions, files)
+        Self::from_descriptions_with_files(None, &descriptions, files)
     }
 
     /// Import immutable handles from a trusted, authenticated generation owner.
     /// Validate the complete layout before creating any guest mapping.
     pub fn from_descriptions(owner: i32, descriptions: &[RegionDescription]) -> io::Result<Self> {
-        Self::from_descriptions_with_files(owner, descriptions, std::collections::HashMap::new())
+        if owner <= 0 {
+            return Err(invalid("invalid layered RAM owner"));
+        }
+        Self::from_descriptions_with_files(
+            Some(owner),
+            descriptions,
+            std::collections::HashMap::new(),
+        )
     }
 
-    fn from_descriptions_with_files(
-        owner: i32,
+    pub(crate) fn from_descriptions_with_files(
+        owner: Option<i32>,
         descriptions: &[RegionDescription],
         mut files: std::collections::HashMap<i32, Arc<File>>,
     ) -> io::Result<Self> {
-        if owner <= 0 || descriptions.is_empty() || descriptions.len() > 256 {
-            return Err(invalid("invalid layered RAM owner or region count"));
+        if descriptions.is_empty() || descriptions.len() > 256 {
+            return Err(invalid("invalid layered RAM region count"));
         }
         let mut regions = Vec::new();
         let mut previous_end = 0;
@@ -380,6 +383,7 @@ impl Generation {
                 let file = if let Some(file) = files.get(&extent.fd) {
                     file.clone()
                 } else {
+                    let owner = owner.ok_or_else(|| invalid("missing retained RAM descriptor"))?;
                     if files.len() >= 1024 {
                         return Err(invalid("too many layered RAM files"));
                     }
@@ -415,6 +419,16 @@ impl Generation {
             previous_end = end;
         }
         Ok(Self { regions })
+    }
+
+    #[cfg(feature = "blk")]
+    pub fn export_resource(&self) -> io::Result<crate::resource_export::ResourceExport> {
+        crate::resource_export::ResourceExport::new(
+            self.descriptions(),
+            self.regions
+                .iter()
+                .flat_map(|region| region.extents.iter().map(|extent| Arc::clone(&extent.file))),
+        )
     }
 
     pub fn descriptions(&self) -> Vec<RegionDescription> {
