@@ -11,6 +11,7 @@ import re
 import secrets
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,12 @@ class Block(ct.Structure):
                 ("layers", ct.POINTER(Layer)), ("count", ct.c_size_t)]
 
 
+class Tap(ct.Structure):
+    _fields_ = [("size",ct.c_uint32),("version",ct.c_uint32),("device",ct.c_char*64),
+                ("features",ct.c_uint32),("mtu",ct.c_uint16),("queues",ct.c_uint16),("header",ct.c_uint16),
+                ("mac",ct.c_ubyte*6),("digest",ct.c_ubyte*32)]
+
+
 def boot(args, config):
     api = ct.CDLL(str(args.lib))
     ctx = api.krun_create_ctx()
@@ -38,6 +45,13 @@ def boot(args, config):
         rc = getattr(api, name)(ctx, *values)
         if rc < 0:
             raise OSError(-rc, name)
+    if "tap" in config:
+        tap=config["tap"]
+        spec=Tap(ct.sizeof(Tap),1,b"net0",3,1500,1,12,
+                 (ct.c_ubyte*6).from_buffer_copy(bytes.fromhex(tap["mac"])),
+                 (ct.c_ubyte*32).from_buffer_copy(bytes.fromhex(tap["digest"])))
+        call("krun_add_net_tap_fd_v1",ct.byref(spec),tap["fd"])
+        os.close(tap["fd"])
     call("krun_set_vm_config", 2, 512)
     call("krun_add_virtio_console_default", 0, 1, 2)
     call("krun_set_kernel_console", b"hvc0")
@@ -133,15 +147,37 @@ def run(args, directory):
     disk.chmod(0o400)
     basic = {"helper":hashlib.sha256(args.helper.read_bytes()).hexdigest(), "disk":str(disk)}
     processes, handles = [], []
+    def address(number):
+        return f"10.{90+number}.0."
+    def mac(number):
+        return bytes([2,0,0,0,0,number])
+    def new_tap(number):
+        interface = f"gate{number}"
+        fd=os.open("/dev/net/tun",os.O_RDWR|os.O_NONBLOCK|os.O_CLOEXEC)
+        fcntl.ioctl(fd,0x400454ca,struct.pack("16sH22x",interface.encode(),0x5002))
+        fcntl.ioctl(fd,0x400454d8,struct.pack("i",12))
+        subprocess.run(["ip","addr","add",address(number)+"1/24","dev",interface],check=True)
+        subprocess.run(["ip","link","set",interface,"up"],check=True)
+        return {"fd":fd,"mac":mac(number).hex(),"digest":secrets.token_hex(32)}
+    def ping(number):
+        return subprocess.run(["ping","-n","-q","-I",f"gate{number}","-c","1","-W","1",address(number)+"2"],
+                              stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0
+
     def launch(name, config, passed=()):
         path = directory / (name + ".sock")
         log = directory / (name + ".log")
         cfg = directory / (name + ".json")
+        if args.network:
+            tap=new_tap(config.get("epoch",1))
+            config={**config,"tap":tap}
+            passed=(*passed,tap["fd"])
         cfg.write_text(json.dumps({**basic, **config, "control":str(path)}))
         with log.open("wb") as out:
             proc = subprocess.Popen([sys.executable, __file__, str(args.lib), "--boot", str(cfg)],
                                     pass_fds=passed, stdin=subprocess.DEVNULL, stdout=out, stderr=out,
                                     env={**os.environ, "SMOLVM_FORKABLE":"1", "RUST_LOG":"error"})
+        if args.network:
+            os.close(tap["fd"])
         processes.append(proc)
         def rows():
             if proc.poll() is not None:
@@ -156,8 +192,12 @@ def run(args, directory):
             return wire(control, f"GUEST_GATE_{verb} {token} {tail}")
         assert gate("PREPARE", "2500 5000").startswith("OK")
         until(lambda: " armed 0" in gate("QUERY"))
-        assert gate("PARK", anchor.hex()).startswith("OK")
+        if args.network:
+            assert ping(number), "the kernel must still answer while only userspace is frozen"
+        assert gate("PARK_NETWORK" if args.network else "PARK", anchor.hex()).startswith("OK")
         until(lambda: " parked 0" in gate("QUERY"))
+        if args.network:
+            assert not ping(number), "parked Guest answered through an open host TAP"
         assert '"source_disposition":"STANDBY"' in wire(control, f"STANDBY_ENTER {token} managed")
         prepare = wire(control, f"CAPTURE_PREPARE {token} parked")
         assert '"source_disposition":"HELD"' in prepare, prepare
@@ -167,10 +207,10 @@ def run(args, directory):
         restore.mkdir()
         (restore / "checkpoint.bin").write_bytes(data)
         assert '"source_disposition":"STANDBY"' in wire(control, f"CAPTURE_FINISH {token} RETURN_STANDBY")
-        return token, (restore, descriptor, backings, anchor)
+        return token, (restore, descriptor, backings, anchor, number)
 
     def restored(name, point, epoch, hostname, *, fail=False):
-        restore, descriptor, backings, anchor = point
+        restore, descriptor, backings, anchor, source_number = point
         authority, worker = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         authorities.append(authority)
         authority.settimeout(3)
@@ -178,6 +218,12 @@ def run(args, directory):
         hostname = hostname.encode()
         frame = (b"SGI1\x01\0\0\0" + nonce + epoch.to_bytes(8, "little") + context + secrets.token_bytes(32)
                  + machine + bytes([len(hostname)]) + hostname).ljust(192, b"\0")
+        if args.network:
+            ip=socket.inet_aton
+            tail=(b"NET1"+bytes([1,24,24,0])+mac(source_number)+mac(epoch)+ip(address(source_number)+"2")+
+                  ip(address(epoch)+"2")+ip(address(source_number)+"1")+ip(address(epoch)+"1")+ip(address(epoch)+"1")+
+                  b"eth0".ljust(16,b"\0")+bytes(8))
+            frame=b"SGI2\x02\0\0\0"+frame[8:]+tail
         ctl, rows = launch(name, {"restore": str(restore), "fds": backings, "descriptor": descriptor.hex(),
                                  "authority": worker.fileno(), "context": context.hex(), "epoch": epoch,
                                  "anchor": anchor.hex()}, tuple(backings + [worker.fileno()]))
@@ -190,6 +236,10 @@ def run(args, directory):
             return authority.recv(256)
         assert request(b"\3"+frame[8:64]).startswith(b"ERR")
         assert request(b"\1"+frame[:32]+secrets.token_bytes(32)+frame[64:]).startswith(b"ERR")
+        if args.network:
+            wrong=bytearray(frame)
+            wrong[211]^=8
+            assert request(b"\1"+wrong).startswith(b"ERR"), "wrong target TAP accepted"
         assert request(b"\1"+frame) == b"OK applying"
         expected = b"OK failed_held" if fail else b"OK identity_ready"
         def ready():
@@ -200,6 +250,8 @@ def run(args, directory):
         until(ready)
         time.sleep(.25)
         assert not rows()
+        if args.network:
+            assert not ping(epoch), "closed Guest answered before activation"
         assert request(b"\3"+secrets.token_bytes(56)).startswith(b"ERR")
         if fail:
             assert request(b"\3"+frame[8:64]).startswith(b"ERR")
@@ -210,6 +262,10 @@ def run(args, directory):
         assert request(b"\3"+frame[8:64]) == b"OK activating"
         until(lambda: len(rows()) >= 3)
         assert all(row[1:] == (pid,hostname,machine.hex().encode()) for row in rows()), rows()[:3]
+        if args.network:
+            until(lambda:ping(epoch))
+            observed=(f"UPLINK {address(epoch)}2 "+mac(epoch).hex(":")+f" nameserver {address(epoch)}1").encode()
+            assert observed in (directory/(name+".log")).read_bytes()
         assert request(b"\2"+frame[8:64]) == b"OK released"
         return ctl, rows, lambda: request(b"\1"+frame), machine.hex()
 
@@ -229,6 +285,9 @@ def run(args, directory):
         assert wire(control, f"STANDBY_WAKE {token}").startswith("OK")
         until(lambda: len(source()) > len(fixed)+2)
         assert source()[-1][1:] == (pid,b"capture-source",SOURCE_ID.encode())
+        if args.network:
+            until(lambda:ping(1))
+            print("Guest packet gate stopped kernel ICMP throughout park and target identity; source and child have independent live uplinks",flush=True)
         print(f"parked source and child preserved PID {pid.decode()}; {len(point[2])} sealed RAM FDs; failed identity stayed quarantined",flush=True)
         child_token, branch = capture(ctl, 2, "recursive")
         parked = child()
@@ -263,6 +322,7 @@ if __name__ == "__main__":
     parser.add_argument("--helper", type=Path)
     parser.add_argument("--boot", type=Path)
     parser.add_argument("--work", type=Path)
+    parser.add_argument("--network", action="store_true",help="isolated netns with CAP_NET_ADMIN and ping")
     args = parser.parse_args()
     args.lib = args.lib.resolve()
     if args.boot:

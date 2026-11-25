@@ -164,6 +164,11 @@ impl Net {
         &self.cfg_backend
     }
 
+    /// Stable TAP profile and concrete link identity of this registered device.
+    pub fn managed_tap_identity(&self) -> Option<(TapAttachmentState, [u8; 6])> {
+        Some((self.tap_attachment()?, self.config.mac))
+    }
+
     fn tap_attachment(&self) -> Option<TapAttachmentState> {
         #[cfg(target_os = "linux")]
         if let VirtioNetBackend::TapFd(binding) = &self.cfg_backend {

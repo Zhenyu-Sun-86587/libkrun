@@ -28,6 +28,8 @@ pub(crate) struct DeviceInfo {
     pub quiesce_supported: bool,
     pub block: Option<BlockInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    tap: Option<(devices::virtio::guest_gate::ParkedUplink, serde_json::Value)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     bootstrap_init_sha256: Option<String>,
 }
 
@@ -76,6 +78,22 @@ impl DeviceInfo {
                 .and_then(|fs| fs.block_bootstrap_digest()),
             #[cfg(feature = "aws-nitro")]
             bootstrap_init_sha256: None,
+            #[cfg(feature = "net")]
+            tap: concrete
+                .downcast_ref::<devices::virtio::Net>()
+                .and_then(|net| net.managed_tap_identity())
+                .map(|(binding, mac)| {
+                    (
+                        devices::virtio::guest_gate::ParkedUplink {
+                            device_id: binding.profile.device_id.clone(),
+                            attachment: binding.attachment_digest,
+                            mac,
+                        },
+                        serde_json::json!(binding.profile),
+                    )
+                }),
+            #[cfg(not(feature = "net"))]
+            tap: None,
             block: block.map(|b| BlockInfo {
                 capacity_bytes: b.capacity_bytes(),
                 read_only: b.is_read_only(),

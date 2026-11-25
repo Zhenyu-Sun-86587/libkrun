@@ -7,7 +7,7 @@ use super::{
 use vm_memory::GuestMemoryMmap;
 
 mod target;
-pub use target::{ParkedState, TargetScope};
+pub use target::{ParkedState, ParkedUplink, TargetScope};
 
 pub const DEVICE_TYPE: u32 = 0xff51;
 const COMMAND_BYTES: usize = 36;
@@ -75,8 +75,10 @@ pub struct GuestGate {
     target_scope: Option<TargetScope>,
     target_bound: bool,
     target_done: bool,
-    identity_frame: [u8; 192],
+    identity_frame: [u8; 256],
     request_digest: Option<[u8; 32]>,
+    network_park: bool,
+    target_uplinks: Option<(ParkedUplink, ParkedUplink)>,
     anchor: [u8; 16],
     features: u64,
     interrupt: Option<InterruptTransport>,
@@ -92,8 +94,10 @@ impl Default for GuestGate {
             target_scope: None,
             target_bound: false,
             target_done: false,
-            identity_frame: [0; 192],
+            identity_frame: [0; 256],
             request_digest: None,
+            network_park: false,
+            target_uplinks: None,
             anchor: [0; 16],
             features: 0,
             interrupt: None,
@@ -126,6 +130,14 @@ impl GuestGate {
         self.session
             .as_ref()
             .is_some_and(|s| s.phase == Phase::Released && s.number == number && s.nonce == nonce)
+    }
+
+    pub fn packets_parked(&self) -> bool {
+        self.network_park
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|s| s.phase == Phase::Parked)
     }
 
     pub fn parked_identity(&self) -> Option<([u8; 16], [u8; 32])> {
@@ -203,6 +215,7 @@ impl GuestGate {
                         return Err("EBUSY gate session is active");
                     }
                 }
+                self.network_park = false;
                 self.anchor.fill(0);
                 self.session = Some(Session {
                     number,
@@ -215,7 +228,8 @@ impl GuestGate {
                 self.publish(if self.helper_digest.is_some() { 4 } else { 1 });
             }
         } else {
-            let anchor = if verb == "GUEST_GATE_PARK" {
+            let request_network = verb == "GUEST_GATE_PARK_NETWORK";
+            let anchor = if request_network || verb == "GUEST_GATE_PARK" {
                 let value = fields
                     .next()
                     .filter(|v| v.len() == 32 && v.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -239,13 +253,14 @@ impl GuestGate {
                 .ok_or("ESTALE unknown gate session")?;
             match (verb, s.phase) {
                 ("GUEST_GATE_QUERY", _) => (),
-                ("GUEST_GATE_PARK", Phase::Armed) => {
+                ("GUEST_GATE_PARK" | "GUEST_GATE_PARK_NETWORK", Phase::Armed) => {
+                    self.network_park = request_network;
                     self.anchor = anchor.unwrap();
                     s.phase = Phase::Parking;
-                    self.publish(5);
+                    self.publish(if request_network { 8 } else { 5 });
                 }
-                ("GUEST_GATE_PARK", Phase::Parking | Phase::Parked)
-                    if Some(self.anchor) == anchor =>
+                ("GUEST_GATE_PARK" | "GUEST_GATE_PARK_NETWORK", Phase::Parking | Phase::Parked)
+                    if Some(self.anchor) == anchor && self.network_park == request_network =>
                 {
                     ()
                 }
@@ -285,7 +300,8 @@ impl GuestGate {
         let status = u32::from_le_bytes(self.response[24..28].try_into().unwrap());
         let next = match (s.phase, status, error) {
             (Phase::Preparing, 1, 0) => Phase::Armed,
-            (Phase::Parking, 6, 0) => Phase::Parked,
+            (Phase::Parking, 6, 0) if !self.network_park => Phase::Parked,
+            (Phase::Parking, 9, 0) if self.network_park => Phase::Parked,
             (Phase::Applying, 7, 0) => Phase::IdentityReady,
             (Phase::Applying | Phase::Activating, 8, e) if e < 0 => Phase::FailedHeld,
             (Phase::Activating, 2, 0) => Phase::Released,
@@ -348,7 +364,7 @@ impl VirtioDevice for GuestGate {
         let Some(end) = index.checked_add(data.len()) else {
             return;
         };
-        if (112..304).contains(&index) && end <= 304 {
+        if (112..368).contains(&index) && end <= 368 {
             if self
                 .session
                 .as_ref()

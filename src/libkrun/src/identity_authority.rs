@@ -84,7 +84,7 @@ pub fn serve(socket: UnixDatagram, vmm: Arc<Mutex<vmm::Vmm>>) -> io::Result<()> 
     std::thread::Builder::new()
         .name("krun identity".into())
         .spawn(move || {
-            let mut packet = [0u8; 194];
+            let mut packet = [0u8; 257];
             loop {
                 let size = unsafe {
                     libc::recv(
