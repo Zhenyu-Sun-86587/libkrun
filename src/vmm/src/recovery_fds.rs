@@ -60,8 +60,10 @@ fn retained(kind: Kind, wanted: &[Identity]) -> io::Result<Option<Vec<File>>> {
         let Some(raw) = name.to_str().and_then(|name| name.parse::<i32>().ok()) else {
             continue;
         };
-        let Ok(metadata) = fs::metadata(dirent.path()) else {
-            continue;
+        let metadata = match fs::metadata(dirent.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
         };
         for (index, &identity) in wanted.iter().enumerate() {
             if matched[index].is_some() || !matches(kind, identity, &metadata) {
@@ -70,14 +72,14 @@ fn retained(kind: Kind, wanted: &[Identity]) -> io::Result<Option<Vec<File>>> {
             // Duplication retains the original file description and its OFD lock.
             let duplicate = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 3) };
             if duplicate < 0 {
-                continue;
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EBADF) {
+                    continue;
+                }
+                return Err(error);
             }
             let file = unsafe { File::from_raw_fd(duplicate) };
-            if file
-                .metadata()
-                .is_ok_and(|meta| matches(kind, identity, &meta))
-                && valid_access(kind, &file)
-            {
+            if matches(kind, identity, &file.metadata()?) && valid_access(kind, &file) {
                 matched[index] = Some(file);
             }
         }
