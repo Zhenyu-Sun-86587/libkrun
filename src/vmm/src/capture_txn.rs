@@ -80,12 +80,14 @@ impl DeviceInfo {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Disposition {
     Standby,
+    Waking,
     Running,
     FailedHeld,
     Unknown,
 }
 
 struct StandbyReceipt {
+    managed: bool,
     sequence: u32,
     nonce: u128,
     disposition: Disposition,
@@ -160,9 +162,15 @@ impl Vmm {
             .and_then(|v| u128::from_str_radix(v, 16).ok())
             .filter(|v| *v > 0)
             .ok_or("EINVAL expected a 128-bit standby hold token")?;
-        if verb == "STANDBY_ENTER" && fields.next() != Some("raw") {
-            return Err("ENOTSUP expected explicitly raw standby".into());
-        }
+        let mode = if verb == "STANDBY_ENTER" {
+            Some(match fields.next() {
+                Some("raw") => false,
+                Some("managed") => true,
+                _ => return Err("EINVAL specify raw or managed standby".into()),
+            })
+        } else {
+            None
+        };
         if fields.next().is_some() {
             return Err("EINVAL trailing standby parameters".into());
         }
@@ -171,6 +179,11 @@ impl Vmm {
             .standby
             .as_ref()
             .is_some_and(|s| s.sequence == sequence && s.nonce == nonce);
+        if matching
+            && mode.is_some_and(|m| m != self.capture_control.standby.as_ref().unwrap().managed)
+        {
+            return Err("EINVAL standby mode differs from the original request".into());
+        }
         match verb {
             "STANDBY_ENTER" if !matching => {
                 if self
@@ -184,18 +197,23 @@ impl Vmm {
                 if self.deep_control_holds_vmm() || self.run_state != VmmRunState::Running {
                     return Err("EBUSY VMM is already held".into());
                 }
-                if !self
-                    .guest_gate
-                    .as_ref()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .allows_raw_standby()
-                {
-                    return Err("EBUSY a Guest gate session is active".into());
+                let managed = mode.unwrap();
+                let permitted = {
+                    let gate = self.guest_gate.as_ref().unwrap().lock().unwrap();
+                    if managed {
+                        gate.parked(sequence, nonce)
+                    } else {
+                        gate.allows_raw_standby()
+                    }
+                };
+                if !permitted {
+                    return Err(
+                        "EBUSY Guest freezer does not match the requested standby mode".into(),
+                    );
                 }
                 self.raw_profile().map_err(|e| format!("ENOTSUP {e}"))?;
                 self.capture_control.standby = Some(StandbyReceipt {
+                    managed,
                     sequence,
                     nonce,
                     disposition: Disposition::Unknown,
@@ -222,19 +240,45 @@ impl Vmm {
                     Disposition::Standby => {
                         self.capture_control.standby.as_mut().unwrap().disposition =
                             Disposition::Unknown;
+                        let managed = self.capture_control.standby.as_ref().unwrap().managed;
+                        if managed {
+                            self.guest_gate
+                                .as_ref()
+                                .unwrap()
+                                .lock()
+                                .unwrap()
+                                .control("GUEST_GATE_RELEASE", arguments)
+                                .map_err(str::to_owned)?;
+                        }
                         self.resume().map_err(|e| format!("EIO wake: {e}"))?;
-                        self.capture_control.standby.as_mut().unwrap().disposition =
-                            Disposition::Running;
+                        self.capture_control.standby.as_mut().unwrap().disposition = if managed {
+                            Disposition::Waking
+                        } else {
+                            Disposition::Running
+                        };
                     }
-                    Disposition::Running => (),
+                    Disposition::Running | Disposition::Waking => (),
                     _ => return Err("EIO unresolved VMM or device state".into()),
                 }
             }
             _ => return Err("ESTALE unknown standby session".into()),
         }
+        if self.capture_control.standby.as_ref().unwrap().disposition == Disposition::Waking {
+            let released = self
+                .guest_gate
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .source_released(sequence, nonce);
+            if released {
+                self.capture_control.standby.as_mut().unwrap().disposition = Disposition::Running;
+            }
+        }
         let disposition = match self.capture_control.standby.as_ref().unwrap().disposition {
             Disposition::Running => "RUNNING",
             Disposition::Standby => "STANDBY",
+            Disposition::Waking => "WAKING",
             Disposition::FailedHeld => "FAILED_HELD",
             Disposition::Unknown => "UNKNOWN",
         };
@@ -242,7 +286,7 @@ impl Vmm {
             "OK {}\n",
             serde_json::json!({
                 "protocol":"CaptureControl/1", "session":sequence, "hold_token":format!("{nonce:032x}"),
-                "source_disposition":disposition,"mode":"raw","clone_ready":false
+                "source_disposition":disposition,"mode": if self.capture_control.standby.as_ref().unwrap().managed {"managed"} else {"raw"}, "clone_ready":false
             })
         ))
     }

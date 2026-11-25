@@ -211,6 +211,27 @@ def test(library, executable, standby, helper, wrong_digest, capture):
                 delta = (counter_records()[0][1] - before[0][1]) / 1e6
                 assert 0 < delta < 1500, f"Guest monotonic clock advanced {delta:.2f} ms during stand-by"
                 print(f"raw standby held three counters and a writable disk for 2 s; Guest elapsed {delta:.2f} ms", flush=True)
+                if helper:
+                    session = f"8 {secrets.token_hex(16)}"
+                    anchor = secrets.token_hex(16)
+                    assert command("PREPARE", session, "2000 700").startswith("OK")
+                    phase(session, "armed")
+                    assert command("PARK", session, anchor).startswith("OK")
+                    phase(session, "parked")
+                    fixed = counts()
+                    time.sleep(1)
+                    assert fixed == counts(), "parked source thawed at its old preparation deadline"
+                    assert command("PARK", session, secrets.token_hex(16)).startswith("ERR")
+                    receipt = rpc(f"STANDBY_ENTER {session} managed")
+                    assert receipt["source_disposition"] == "STANDBY" and receipt["mode"] == "managed", receipt
+                    time.sleep(1)
+                    assert counts() == fixed
+                    assert wire(f"GUEST_GATE_RELEASE {session}").startswith("ERR EBUSY")
+                    assert rpc(f"STANDBY_WAKE {session}")["source_disposition"] in ("WAKING", "RUNNING")
+                    wait_for(lambda: rpc(f"STANDBY_QUERY {session}")["source_disposition"] == "RUNNING")
+                    phase(session, "released")
+                    wait_for(lambda: all(b > a for a, b in zip(fixed, counts())))
+                    print("measured standby survived the old gate deadline and woke its original users", flush=True)
                 if capture:
                     previous = set()
                     for seq, finish in [(5, "CAPTURE_FINISH"), (6, "CAPTURE_CANCEL")]:
