@@ -16,6 +16,8 @@ pub mod device;
 mod sys;
 #[cfg(target_os = "linux")]
 mod tap;
+#[cfg(target_os = "linux")]
+pub use tap::TapFd;
 // AF_UNIX datagram sockets exist only on Unix (Windows AF_UNIX is stream-only).
 #[cfg(unix)]
 mod unixgram;
@@ -23,7 +25,7 @@ mod unixstream;
 mod worker;
 
 // https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html#x1-2050006
-const VNET_HDR_LEN: usize = mem::size_of::<virtio_net_hdr_v1>();
+pub const VNET_HDR_LEN: usize = mem::size_of::<virtio_net_hdr_v1>();
 
 // This initializes to all 0 the virtio_net_hdr part of a buf and return the length of the header
 fn write_virtio_net_hdr(buf: &mut [u8]) -> usize {

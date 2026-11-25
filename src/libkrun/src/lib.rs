@@ -10,6 +10,8 @@ use devices::virtio::block::{ImageType, SyncMode};
 use devices::virtio::gpu::display::DisplayInfo;
 #[cfg(feature = "net")]
 use devices::virtio::net::device::VirtioNetBackend;
+#[cfg(all(target_os = "linux", feature = "net"))]
+use devices::virtio::net::{TapFd, VNET_HDR_LEN, device::TapProfile};
 use env_logger::{Env, Target};
 #[cfg(feature = "gpu")]
 use krun_display::DisplayBackend;
@@ -3686,6 +3688,109 @@ pub unsafe extern "C" fn krun_add_net_tap(
     -libc::EINVAL
 }
 
+const TAP_FD_DEVICE_ID_MAX: usize = 64;
+
+#[repr(C)]
+pub struct KrunNetTapFdSpecV1 {
+    size: u32,
+    version: u32,
+    device_id: [u8; TAP_FD_DEVICE_ID_MAX],
+    features: u32,
+    mtu: u16,
+    queue_count: u16,
+    vnet_header_size: u16,
+    mac: [u8; 6],
+    attachment_digest: [u8; 32],
+}
+
+/// Register a broker-owned Linux TAP without changing the caller's namespace.
+///
+/// # Safety
+/// `spec` must point to a readable size/version prefix and, for a recognized
+/// size and version, to a readable `KrunNetTapFdSpecV1` for this call.
+#[unsafe(no_mangle)]
+#[cfg(all(target_os = "linux", feature = "net"))]
+pub unsafe extern "C" fn krun_add_net_tap_fd_v1(
+    ctx_id: u32,
+    spec: *const KrunNetTapFdSpecV1,
+    tap_fd: i32,
+) -> i32 {
+    // Read the prefix before accessing the rest of the versioned C struct.
+    if spec.is_null() {
+        return -libc::EINVAL;
+    }
+    let prefix = spec.cast::<[u32; 2]>();
+    // SAFETY: the caller supplies at least the readable prefix.
+    let [size, version] = unsafe { prefix.read_unaligned() };
+    if size as usize != std::mem::size_of::<KrunNetTapFdSpecV1>() || version != 1 {
+        return -libc::EINVAL;
+    }
+    // SAFETY: the recognized prefix requires this full struct.
+    let spec = unsafe { spec.read_unaligned() };
+    let Some(end) = spec.device_id.iter().position(|byte| *byte == 0) else {
+        return -libc::EINVAL;
+    };
+    let id = &spec.device_id[..end];
+    if !id.first().is_some_and(u8::is_ascii_alphanumeric)
+        || !id
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || spec.queue_count != 1
+        || spec.mtu != 1500
+        || usize::from(spec.vnet_header_size) != VNET_HDR_LEN
+        || spec.features & !(NET_FEATURE_CSUM | NET_FEATURE_GUEST_CSUM) != 0
+        || spec.mac[0] & 1 != 0
+        || spec.mac == [0; 6]
+        || spec.attachment_digest == [0; 32]
+    {
+        return -libc::EINVAL;
+    }
+    let id = String::from_utf8(id.to_vec()).expect("validated ASCII device ID");
+    let profile = TapProfile {
+        device_id: id.clone(),
+        mtu: spec.mtu,
+        queue_count: spec.queue_count,
+        features: spec.features,
+        vnet_header_size: spec.vnet_header_size,
+    };
+    let binding = match TapFd::duplicate(tap_fd, profile, spec.attachment_digest) {
+        Ok(binding) => binding,
+        Err(err) => {
+            debug!("TAP fd rejected: {err}");
+            return -err.raw_os_error().unwrap_or(libc::EINVAL);
+        }
+    };
+    let mut contexts = CTX_MAP.lock().unwrap();
+    let Some(cfg) = contexts.get_mut(&ctx_id) else {
+        return -libc::ENOENT;
+    };
+    if has_net_device(cfg, &id) {
+        return -libc::EEXIST;
+    }
+    match cfg.vmr.add_network_interface(NetworkInterfaceConfig {
+        iface_id: id,
+        backend: VirtioNetBackend::TapFd(binding),
+        mac: spec.mac,
+        features: spec.features,
+    }) {
+        Ok(()) => KRUN_SUCCESS,
+        Err(err) => {
+            error!("Could not prepare TAP fd network device: {err}");
+            -libc::EIO
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+#[cfg(not(all(target_os = "linux", feature = "net")))]
+pub extern "C" fn krun_add_net_tap_fd_v1(
+    _ctx_id: u32,
+    _spec: *const KrunNetTapFdSpecV1,
+    _tap_fd: i32,
+) -> i32 {
+    -libc::ENOTSUP
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn krun_set_port_map(ctx_id: u32, c_port_map: *const *const c_char) -> i32 {
@@ -5087,19 +5192,34 @@ pub unsafe extern "C" fn krun_set_smbios_oem_strings(
 }
 
 #[cfg(feature = "net")]
+fn has_net_device(ctx: &ContextConfig, id: &str) -> bool {
+    ctx.vmr
+        .net
+        .list
+        .iter()
+        .any(|net| net.lock().unwrap().id() == id)
+}
+
+#[cfg(feature = "net")]
 fn create_virtio_net(
     ctx_cfg: &mut ContextConfig,
     backend: VirtioNetBackend,
     mac: [u8; 6],
     features: u32,
 ) {
+    let iface_id = loop {
+        let id = format!("eth{}", ctx_cfg.net_index);
+        ctx_cfg.net_index += 1;
+        if !has_net_device(ctx_cfg, &id) {
+            break id;
+        }
+    };
     let network_interface_config = NetworkInterfaceConfig {
-        iface_id: format!("eth{}", ctx_cfg.net_index),
+        iface_id,
         backend,
         mac,
         features,
     };
-    ctx_cfg.net_index += 1;
     ctx_cfg
         .vmr
         .add_network_interface(network_interface_config)

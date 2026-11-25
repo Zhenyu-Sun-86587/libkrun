@@ -18,6 +18,8 @@ use crate::virtio::{
 use std::thread::JoinHandle;
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 
+#[cfg(target_os = "linux")]
+use super::TapFd;
 use super::backend::{ReadError, WriteError};
 use super::worker::NetWorker;
 
@@ -78,6 +80,23 @@ pub enum VirtioNetBackend {
     UnixgramPath(PathBuf, bool),
     #[cfg(target_os = "linux")]
     Tap(String),
+    #[cfg(target_os = "linux")]
+    TapFd(TapFd),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TapProfile {
+    pub device_id: String,
+    pub mtu: u16,
+    pub queue_count: u16,
+    pub features: u32,
+    pub vnet_header_size: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TapAttachmentState {
+    pub profile: TapProfile,
+    pub attachment_digest: [u8; 32],
 }
 
 pub struct Net {
@@ -144,6 +163,17 @@ impl Net {
     pub fn backend(&self) -> &VirtioNetBackend {
         &self.cfg_backend
     }
+
+    fn tap_attachment(&self) -> Option<TapAttachmentState> {
+        #[cfg(target_os = "linux")]
+        if let VirtioNetBackend::TapFd(binding) = &self.cfg_backend {
+            return Some(TapAttachmentState {
+                profile: binding.profile.clone(),
+                attachment_digest: binding.attachment_digest,
+            });
+        }
+        None
+    }
 }
 
 /// Serializable runtime state of the [`Net`] device, for VM checkpoint/fork.
@@ -161,6 +191,8 @@ pub struct NetState {
     /// ([`Net::quiesce_for_snapshot`]). `None` if not activated/quiesced.
     pub queue_rx: Option<QueueState>,
     pub queue_tx: Option<QueueState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tap_attachment: Option<TapAttachmentState>,
 }
 
 impl Net {
@@ -179,12 +211,25 @@ impl Net {
             activated: matches!(self.device_state, DeviceState::Activated(..)),
             queue_rx,
             queue_tx,
+            tap_attachment: self.tap_attachment(),
         }
     }
 
     /// Restore device-level + virtqueue state. The worker must be quiesced first;
     /// the restored indices take effect when [`Self::rearm_after_snapshot`] re-arms it.
     pub fn restore_state(&mut self, state: &NetState) -> std::result::Result<(), String> {
+        let target = self.tap_attachment();
+        let source_profile = state
+            .tap_attachment
+            .as_ref()
+            .map(|attachment| &attachment.profile);
+        let target_profile = target.as_ref().map(|attachment| &attachment.profile);
+        if source_profile != target_profile {
+            return Err("TAP fd restore requires the same stable device ID and profile".into());
+        }
+        if source_profile.is_some() && state.acked_features & !self.avail_features != 0 {
+            return Err("TAP fd restore has unsupported negotiated features".into());
+        }
         self.acked_features = state.acked_features;
         if let (Some(worker), Some(rx), Some(tx)) = (
             self.quiesced_worker.as_mut(),

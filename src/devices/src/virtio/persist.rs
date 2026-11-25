@@ -49,6 +49,9 @@ pub enum DeviceSnapshot {
     Gpu(GpuState),
     #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "tee")))]
     Memory(MemoryDeviceState),
+    /// Distinct from legacy Net so an older reader refuses a broker-owned TAP.
+    #[cfg(feature = "net")]
+    TapNet(NetState),
 }
 
 impl DeviceSnapshot {
@@ -70,7 +73,7 @@ impl DeviceSnapshot {
             #[cfg(feature = "blk")]
             DeviceSnapshot::Block(_) => TYPE_BLOCK,
             #[cfg(feature = "net")]
-            DeviceSnapshot::Net(_) => TYPE_NET,
+            DeviceSnapshot::Net(_) | DeviceSnapshot::TapNet(_) => TYPE_NET,
             #[cfg(feature = "gpu")]
             DeviceSnapshot::Gpu(_) => TYPE_GPU,
         }
@@ -92,7 +95,7 @@ impl DeviceSnapshot {
             #[cfg(feature = "blk")]
             DeviceSnapshot::Block(s) => s.acked_features,
             #[cfg(feature = "net")]
-            DeviceSnapshot::Net(s) => s.acked_features,
+            DeviceSnapshot::Net(s) | DeviceSnapshot::TapNet(s) => s.acked_features,
             #[cfg(feature = "gpu")]
             DeviceSnapshot::Gpu(s) => s.acked_features,
         }
@@ -117,7 +120,9 @@ impl DeviceSnapshot {
             #[cfg(feature = "blk")]
             DeviceSnapshot::Block(s) => vec![s.queue.clone()],
             #[cfg(feature = "net")]
-            DeviceSnapshot::Net(s) => vec![s.queue_rx.clone(), s.queue_tx.clone()],
+            DeviceSnapshot::Net(s) | DeviceSnapshot::TapNet(s) => {
+                vec![s.queue_rx.clone(), s.queue_tx.clone()]
+            }
             #[cfg(feature = "gpu")]
             DeviceSnapshot::Gpu(s) => s.queues.clone(),
         }
@@ -182,7 +187,12 @@ pub fn snapshot_device(dev: &dyn VirtioDevice) -> Option<DeviceSnapshot> {
     }
     #[cfg(feature = "net")]
     if let Some(d) = any.downcast_ref::<Net>() {
-        return Some(DeviceSnapshot::Net(d.save_state()));
+        let snapshot = d.save_state();
+        return Some(if snapshot.tap_attachment.is_some() {
+            DeviceSnapshot::TapNet(snapshot)
+        } else {
+            DeviceSnapshot::Net(snapshot)
+        });
     }
     #[cfg(feature = "gpu")]
     if let Some(d) = any.downcast_ref::<Gpu>() {
@@ -230,10 +240,14 @@ pub fn restore_device(dev: &mut dyn VirtioDevice, snap: &DeviceSnapshot) -> Resu
             .ok_or_else(|| "snapshot/device mismatch: expected Block".to_string())?
             .restore_state(s),
         #[cfg(feature = "net")]
-        DeviceSnapshot::Net(s) => any
-            .downcast_mut::<Net>()
-            .ok_or_else(|| "snapshot/device mismatch: expected Net".to_string())?
-            .restore_state(s),
+        DeviceSnapshot::Net(s) | DeviceSnapshot::TapNet(s) => {
+            if s.tap_attachment.is_some() != matches!(snap, DeviceSnapshot::TapNet(_)) {
+                return Err("invalid TAP fd snapshot attachment".into());
+            }
+            any.downcast_mut::<Net>()
+                .ok_or_else(|| "snapshot/device mismatch: expected Net".to_string())?
+                .restore_state(s)
+        }
         #[cfg(feature = "gpu")]
         DeviceSnapshot::Gpu(s) => any
             .downcast_mut::<Gpu>()
