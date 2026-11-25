@@ -216,6 +216,13 @@ struct ContextConfig {
         not(feature = "tee")
     ))]
     worker_pivot: Option<worker_pivot::Config>,
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    target_authority: Option<std::os::unix::net::UnixDatagram>,
     vsock_config: VsockConfig,
     #[cfg(feature = "blk")]
     block_cfgs: Vec<BlockDeviceConfig>,
@@ -530,6 +537,13 @@ struct PreparedSave {
     memory: vmm::snapshot::DeferredMemorySave,
 }
 
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "blk",
+    not(feature = "tee")
+))]
+mod identity_authority;
 #[cfg(all(target_os = "linux", feature = "blk", not(feature = "tee")))]
 mod managed_disks;
 #[cfg(all(snapshot_supported, deferred_stream_supported))]
@@ -6395,13 +6409,38 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         return -libc::EINVAL;
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    let parked_target = ctx_cfg.target_authority.is_some();
+    #[cfg(not(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    )))]
+    let parked_target = false;
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    if parked_target && (ctx_cfg.snapshot_dir.is_none() || ctx_cfg.diskless_snapshot_ram.is_none())
+    {
+        set_last_error("parked target requires its retained capture and RAM generation");
+        return -libc::EINVAL;
+    }
     #[cfg(all(target_os = "linux", fork_supported, feature = "blk"))]
     if ctx_cfg.diskless_snapshot_ram.is_some()
         && (ctx_cfg.snapshot_dir.is_none()
             || ctx_cfg.snapshot_memory.is_some()
             || !ctx_cfg.block_cfgs.is_empty()
-            || !ctx_cfg.vmr.block.list.is_empty()
-            || ctx_cfg.block_root.is_some())
+            || (!parked_target
+                && (!ctx_cfg.vmr.block.list.is_empty() || ctx_cfg.block_root.is_some())))
     {
         set_last_error("detached RAM requires a snapshot directory and a diskless VM");
         return -libc::EINVAL;
@@ -6409,7 +6448,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
     #[cfg(feature = "blk")]
     if !ctx_cfg.vmr.block.list.is_empty()
-        && (!ctx_cfg.block_cfgs.is_empty() || ctx_cfg.snapshot_dir.is_some())
+        && (!ctx_cfg.block_cfgs.is_empty() || (ctx_cfg.snapshot_dir.is_some() && !parked_target))
     {
         set_last_error("managed block attachments require a fully managed cold-boot context");
         return -libc::EINVAL;
@@ -6544,9 +6583,11 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                 layered_restore_ctx(&dir, generation).and_then(|restore| {
                     let state = vmm::VmCheckpoint::deserialize(&restore.checkpoint)
                         .map_err(|error| format!("decode checkpoint: {error}"))?;
-                    if state.devices.devices.iter().any(|device| {
-                        matches!(device, devices::virtio::persist::DeviceSnapshot::Block(_))
-                    }) {
+                    if !parked_target
+                        && state.devices.devices.iter().any(|device| {
+                            matches!(device, devices::virtio::persist::DeviceSnapshot::Block(_))
+                        })
+                    {
                         return Err("detached RAM restore requires a diskless checkpoint".into());
                     }
                     Ok(restore)
@@ -6607,6 +6648,18 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     };
     lk_timing!("build_microvm done");
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    if let Some(authority) = ctx_cfg.target_authority.take()
+        && let Err(e) = identity_authority::serve(authority, _vmm.clone())
+    {
+        set_last_error(format!("start Guest identity authority: {e}"));
+        return -libc::EIO;
+    }
 
     // Publish the guest-RAM host mapping so an in-process embedder (e.g. a CUDA
     // forwarding server on another thread) can read guest memory directly for

@@ -301,6 +301,51 @@ impl Fs {
         self.map_sender = Some(map_sender);
     }
 
+    /// Identify the virtual-only bootstrap filesystem used for block-root boots.
+    /// Its only readable file is the immutable embedded static init.
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    pub fn block_bootstrap_digest(&self) -> Option<String> {
+        use super::virtual_entry::VirtualEntryContent;
+        use sha2::{Digest, Sha256};
+        let tag = self.config.tag;
+        if self.passthrough_cfg.is_some()
+            || self.live_tag.is_some()
+            || tag.split(|b| *b == 0).next()? != b"/dev/root"
+            || self.virtual_entries.len() != 5
+        {
+            return None;
+        }
+        let mut digest = None;
+        let mut dirs = std::collections::BTreeSet::new();
+        for e in &self.virtual_entries {
+            if e.entry.mode != 0o755 {
+                return None;
+            }
+            match (e.name.as_bytes(), &e.entry.content, e.entry.one_shot) {
+                (b"init.krun", VirtualEntryContent::File { data }, true) if !data.is_empty() => {
+                    digest = Some(format!("{:x}", Sha256::digest(data)));
+                }
+                (
+                    name @ (b"dev" | b"sys" | b"proc" | b"newroot"),
+                    VirtualEntryContent::Dir { children },
+                    false,
+                ) if children.is_empty() => {
+                    dirs.insert(name);
+                }
+                _ => return None,
+            }
+        }
+        if dirs.len() != 4 {
+            return None;
+        }
+        digest
+    }
+
     /// Capture this device's runtime state for VM checkpoint/fork. The worker
     /// must be quiesced ([`Self::quiesce_for_snapshot`]) first so the virtqueue
     /// indices can be read; otherwise the queues are owned by the worker.
