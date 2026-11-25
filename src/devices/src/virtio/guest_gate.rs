@@ -14,6 +14,8 @@ const RESPONSE_BYTES: usize = 28;
 enum Phase {
     Preparing,
     Armed,
+    Parking,
+    Parked,
     Releasing,
     Aborting,
     Released,
@@ -35,6 +37,8 @@ impl Phase {
         match self {
             Self::Preparing => "preparing",
             Self::Armed => "armed",
+            Self::Parking => "parking",
+            Self::Parked => "parked",
             Self::Releasing => "releasing",
             Self::Aborting => "aborting",
             Self::Released => "released",
@@ -57,6 +61,7 @@ struct Session {
 
 pub struct GuestGate {
     helper_digest: Option<[u8; 32]>,
+    anchor: [u8; 16],
     features: u64,
     interrupt: Option<InterruptTransport>,
     session: Option<Session>,
@@ -68,6 +73,7 @@ impl Default for GuestGate {
     fn default() -> Self {
         Self {
             helper_digest: None,
+            anchor: [0; 16],
             features: 0,
             interrupt: None,
             session: None,
@@ -83,6 +89,23 @@ impl GuestGate {
             helper_digest,
             ..Self::default()
         }
+    }
+
+    pub fn parked(&self, number: u32, nonce: u128) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.phase == Phase::Parked && s.number == number && s.nonce == nonce)
+    }
+
+    pub fn source_released(&self, number: u32, nonce: u128) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.phase == Phase::Released && s.number == number && s.nonce == nonce)
+    }
+
+    pub fn parked_identity(&self) -> Option<([u8; 16], [u8; 32])> {
+        self.session.as_ref().filter(|s| s.phase == Phase::Parked)?;
+        Some((self.anchor, self.helper_digest?))
     }
 
     pub fn allows_raw_standby(&self) -> bool {
@@ -152,6 +175,7 @@ impl GuestGate {
                         return Err("EBUSY gate session is active");
                     }
                 }
+                self.anchor.fill(0);
                 self.session = Some(Session {
                     number,
                     nonce,
@@ -163,6 +187,20 @@ impl GuestGate {
                 self.publish(if self.helper_digest.is_some() { 4 } else { 1 });
             }
         } else {
+            let anchor = if verb == "GUEST_GATE_PARK" {
+                let value = fields
+                    .next()
+                    .filter(|v| v.len() == 32 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .and_then(|v| u128::from_str_radix(v, 16).ok())
+                    .filter(|v| *v != 0 && *v != nonce)
+                    .ok_or("EINVAL expected a distinct nonzero capture anchor")?;
+                if self.helper_digest.is_none() {
+                    return Err("ENOTSUP measured helper is required to park");
+                }
+                Some(value.to_be_bytes())
+            } else {
+                None
+            };
             if fields.next().is_some() {
                 return Err("EINVAL trailing gate parameters");
             }
@@ -173,12 +211,22 @@ impl GuestGate {
                 .ok_or("ESTALE unknown gate session")?;
             match (verb, s.phase) {
                 ("GUEST_GATE_QUERY", _) => (),
-                ("GUEST_GATE_RELEASE", Phase::Armed) => {
+                ("GUEST_GATE_PARK", Phase::Armed) => {
+                    self.anchor = anchor.unwrap();
+                    s.phase = Phase::Parking;
+                    self.publish(5);
+                }
+                ("GUEST_GATE_PARK", Phase::Parking | Phase::Parked)
+                    if Some(self.anchor) == anchor =>
+                {
+                    ()
+                }
+                ("GUEST_GATE_RELEASE", Phase::Armed | Phase::Parked) => {
                     s.phase = Phase::Releasing;
                     self.publish(2);
                 }
                 ("GUEST_GATE_RELEASE", Phase::Releasing | Phase::Released) => (),
-                ("GUEST_GATE_ABORT", Phase::Preparing | Phase::Armed) => {
+                ("GUEST_GATE_ABORT", Phase::Preparing | Phase::Armed | Phase::Parked) => {
                     s.phase = Phase::Aborting;
                     self.publish(3);
                 }
@@ -209,18 +257,27 @@ impl GuestGate {
         let status = u32::from_le_bytes(self.response[24..28].try_into().unwrap());
         let next = match (s.phase, status, error) {
             (Phase::Preparing, 1, 0) => Phase::Armed,
+            (Phase::Parking, 6, 0) => Phase::Parked,
             (Phase::Releasing, 2, 0) => Phase::Released,
             (Phase::Aborting, 3, 0) => Phase::Aborted,
-            (Phase::Preparing | Phase::Armed | Phase::Releasing | Phase::Aborting, 4, e)
-                if e == -libc::ETIMEDOUT =>
-            {
-                Phase::Expired
-            }
-            (Phase::Preparing | Phase::Armed | Phase::Releasing | Phase::Aborting, 5, e)
-                if e < 0 =>
-            {
-                Phase::FailedThawed
-            }
+            (
+                Phase::Preparing
+                | Phase::Armed
+                | Phase::Parking
+                | Phase::Releasing
+                | Phase::Aborting,
+                4,
+                e,
+            ) if e == -libc::ETIMEDOUT => Phase::Expired,
+            (
+                Phase::Preparing
+                | Phase::Armed
+                | Phase::Parking
+                | Phase::Releasing
+                | Phase::Aborting,
+                5,
+                e,
+            ) if e < 0 => Phase::FailedThawed,
             _ => return,
         };
         s.phase = next;
@@ -254,6 +311,10 @@ impl VirtioDevice for GuestGate {
         let Some(end) = index.checked_add(data.len()) else {
             return;
         };
+        if (96..112).contains(&index) && end <= 112 {
+            data.copy_from_slice(&self.anchor[index - 96..end - 96]);
+            return;
+        }
         if (64..96).contains(&index) && end <= 96 {
             if let Some(digest) = &self.helper_digest {
                 data.copy_from_slice(&digest[index - 64..end - 64]);

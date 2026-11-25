@@ -1,5 +1,7 @@
 """Boot a two-vCPU Guest and check the host-controlled source freezer on KVM."""
 import argparse
+import array
+import fcntl
 import ctypes
 import hashlib
 import json
@@ -44,7 +46,49 @@ def guest(library, root, address, standby, expected_helper):
     set_option("krun_start_enter")
 
 
-def test(library, executable, standby, helper, wrong_digest):
+def receive_capture(address, session):
+    def exact(sock, count):
+        data = bytearray()
+        while len(data) < count:
+            part = sock.recv(count - len(data))
+            assert part, "incomplete native capture export"
+            data.extend(part)
+        return bytes(data)
+
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.settimeout(5)
+        sock.connect(str(address))
+        sock.sendall(f"CAPTURE_EXPORT {session}\n".encode())
+        header = bytearray()
+        while not header.endswith(b"\n"):
+            assert len(header) < 1024 * 1024, "capture header too large"
+            header.extend(exact(sock, 1))
+        assert header.startswith(b"OK "), header
+        output = json.loads(header[3:])
+        state = exact(sock, output["checkpoint_bytes"])
+        descriptor = exact(sock, output["descriptor_bytes"])
+        sizes = json.loads(descriptor)["backing_sizes"]
+        assert len(sizes) == output["fd_count"] > 0
+        seen = {}
+        for key in sorted(sizes):
+            body, ancillary, flags, _ = sock.recvmsg(1, socket.CMSG_SPACE(4), socket.MSG_CMSG_CLOEXEC)
+            assert body == b"F" and len(ancillary) == 1 and not flags & socket.MSG_CTRUNC
+            level, kind, raw = ancillary.pop()
+            assert (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS)
+            handles = array.array("i", raw)
+            assert len(handles) == 1
+            with os.fdopen(handles[0], "rb") as backing:
+                seals = fcntl.fcntl(backing, fcntl.F_GET_SEALS)
+                required = fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_WRITE
+                assert seals & required == required
+                assert fcntl.fcntl(backing, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
+                st = os.fstat(backing.fileno())
+                assert st.st_size == sizes[key] and key == f"ram-{st.st_dev:x}-{st.st_ino:x}"
+                seen[key] = (st.st_ino, st.st_size)
+        return output, hashlib.sha256(state).digest(), hashlib.sha256(descriptor).digest(), seen
+
+
+def test(library, executable, standby, helper, wrong_digest, capture):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp, "root")
         root.mkdir()
@@ -65,6 +109,7 @@ def test(library, executable, standby, helper, wrong_digest):
         proc = subprocess.Popen(
             [sys.executable, __file__, str(library), str(root), "--guest", str(address)] + (["--standby"] if standby else []) + measured,
             stdin=subprocess.DEVNULL,
+            env={**os.environ, **({"SMOLVM_FORKABLE":"1"} if capture else {})},
         )
         def wire(line):
             with socket.socket(socket.AF_UNIX) as sock:
@@ -137,7 +182,7 @@ def test(library, executable, standby, helper, wrong_digest):
 
                 devices = rpc("CAPTURE_INVENTORY")["devices"]
                 disks = {d["device_id"]: d["block"] for d in devices if d["block"]}
-                assert disks == {i: {"read_only": ro, "capacity_bytes": 4 * 1024 * 1024}
+                assert disks == {i: {"read_only": ro, "capacity_bytes": 4 * 1024 * 1024, "managed_attachment": None}
                                  for i, ro in [("data0", False), ("archive", True)]}, disks
                 assert len({d["mmio_address"] for d in devices}) == len(devices)
                 assert any(d["device_id"] == "guest-gate" for d in devices)
@@ -166,6 +211,56 @@ def test(library, executable, standby, helper, wrong_digest):
                 delta = (counter_records()[0][1] - before[0][1]) / 1e6
                 assert 0 < delta < 1500, f"Guest monotonic clock advanced {delta:.2f} ms during stand-by"
                 print(f"raw standby held three counters and a writable disk for 2 s; Guest elapsed {delta:.2f} ms", flush=True)
+                if helper:
+                    session = f"8 {secrets.token_hex(16)}"
+                    anchor = secrets.token_hex(16)
+                    assert command("PREPARE", session, "2000 700").startswith("OK")
+                    phase(session, "armed")
+                    assert command("PARK", session, anchor).startswith("OK")
+                    phase(session, "parked")
+                    fixed = counts()
+                    time.sleep(1)
+                    assert fixed == counts(), "parked source thawed at its old preparation deadline"
+                    assert command("PARK", session, secrets.token_hex(16)).startswith("ERR")
+                    receipt = rpc(f"STANDBY_ENTER {session} managed")
+                    assert receipt["source_disposition"] == "STANDBY" and receipt["mode"] == "managed", receipt
+                    time.sleep(1)
+                    assert counts() == fixed
+                    assert wire(f"GUEST_GATE_RELEASE {session}").startswith("ERR EBUSY")
+                    assert rpc(f"STANDBY_WAKE {session}")["source_disposition"] in ("WAKING", "RUNNING")
+                    wait_for(lambda: rpc(f"STANDBY_QUERY {session}")["source_disposition"] == "RUNNING")
+                    phase(session, "released")
+                    wait_for(lambda: all(b > a for a, b in zip(fixed, counts())))
+                    print("measured standby survived the old gate deadline and woke its original users", flush=True)
+                if capture:
+                    previous = set()
+                    for seq, finish in [(5, "CAPTURE_FINISH"), (6, "CAPTURE_CANCEL")]:
+                        token = f"{seq} {secrets.token_hex(16)}"
+                        receipt = rpc(f"CAPTURE_PREPARE {token} raw")
+                        assert receipt["source_disposition"] == "HELD" and not receipt["clone_ready"]
+                        assert rpc(f"CAPTURE_PREPARE {token} raw") == rpc(f"CAPTURE_QUERY {token}") == receipt
+                        assert wire(f"STANDBY_WAKE {hold}").startswith("ERR EBUSY")
+                        assert wire(f"CAPTURE_FINISH {seq} {secrets.token_hex(16)} CONTINUE").startswith("ERR ESTALE")
+                        assert wire("RESUME").startswith("ERR EBUSY")
+                        start = (counts(), disk_counter())
+                        with socket.socket(socket.AF_UNIX) as abandoned:
+                            abandoned.connect(str(address))
+                            abandoned.sendall(f"CAPTURE_EXPORT {token}\n".encode())
+                        first = receive_capture(address, token)
+                        assert first[0]["devices"] and first == receive_capture(address, token)
+                        assert rpc(f"CAPTURE_FINISH {token} KEEP_HELD") == receipt
+                        assert (counts(), disk_counter()) == start
+                        assert previous < set(first[3]), "a later capture must preserve base inodes and add deltas"
+                        previous = set(first[3])
+                        decision = f"{finish} {token}" + (" CONTINUE" if finish == "CAPTURE_FINISH" else "")
+                        assert rpc(decision)["source_disposition"] == "RUNNING"
+                        assert rpc(decision) == rpc(f"CAPTURE_QUERY {token}")
+                        if finish == "CAPTURE_FINISH":
+                            assert first == receive_capture(address, token)
+                        else:
+                            assert wire(f"CAPTURE_EXPORT {token}").startswith("ERR EBUSY")
+                        wait_for(lambda: all(b > a for a, b in zip(start[0], counts())) and disk_counter() > start[1])
+                        print(f"held raw capture {seq}: {len(previous)} original sealed FDs, repeatable checkpoint, {finish}", flush=True)
         finally:
             proc.terminate()
             try:
@@ -181,6 +276,7 @@ if __name__ == "__main__":
     parser.add_argument("guest_path", type=Path)
     parser.add_argument("--guest", type=Path, metavar="CONTROL_SOCKET", help=argparse.SUPPRESS)
     parser.add_argument("--standby", action="store_true", help="exercise raw standby with two test disks")
+    parser.add_argument("--capture", action="store_true", help="also export held vCPU/device state and sealed RAM")
     parser.add_argument("--identity-helper", type=Path, help="pin the actual static helper executable")
     parser.add_argument("--wrong-digest", action="store_true", help="require pre-freeze measurement rejection")
     parser.add_argument("--expected-helper", help=argparse.SUPPRESS)
@@ -190,4 +286,4 @@ if __name__ == "__main__":
     if args.guest:
         guest(args.libkrun.resolve(), args.guest_path, args.guest, args.standby, args.expected_helper)
     else:
-        test(args.libkrun.resolve(), args.guest_path.resolve(), args.standby, args.identity_helper, args.wrong_digest)
+        test(args.libkrun.resolve(), args.guest_path.resolve(), args.standby or args.capture, args.identity_helper, args.wrong_digest, args.capture)

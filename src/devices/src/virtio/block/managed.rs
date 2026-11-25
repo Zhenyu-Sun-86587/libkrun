@@ -11,7 +11,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ManagedAttachment {
     pub attachment_id: String,
     pub device_id: String,

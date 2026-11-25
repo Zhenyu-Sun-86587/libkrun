@@ -2016,6 +2016,7 @@ fn lazy_ram_unready(verb: &str) -> Option<String> {
             | "FINISH_SAVE_STREAM"
             | "FINISH_SAVE_SPARSE"
             | "FORK"
+            | "CAPTURE_PREPARE"
             | "FORK_CONTINUE"
             | "FORK_CONTINUE_PAGED"
     );
@@ -2043,6 +2044,15 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) 
             // and those are cfg-gated out on aarch64-linux, where it'd otherwise
             // be an unused-variable error under -D warnings.
             let _arg = parts.next().map(str::trim).unwrap_or("");
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+            if (verb.starts_with("CAPTURE_")
+                || verb.starts_with("STANDBY_")
+                || verb.starts_with("GUEST_GATE_"))
+                && !vmm::retained_fds::local_control_peer(&stream)
+            {
+                let _ = stream.write_all(b"ERR EPERM untrusted native control peer\n");
+                return;
+            }
             #[cfg(all(
                 target_os = "linux",
                 target_arch = "x86_64",
@@ -2054,6 +2064,11 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) 
                     verb.as_str(),
                     "STATUS"
                         | "CAPTURE_INVENTORY"
+                        | "CAPTURE_PREPARE"
+                        | "CAPTURE_QUERY"
+                        | "CAPTURE_EXPORT"
+                        | "CAPTURE_FINISH"
+                        | "CAPTURE_CANCEL"
                         | "STANDBY_ENTER"
                         | "STANDBY_QUERY"
                         | "STANDBY_WAKE"
@@ -2065,6 +2080,7 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) 
             }
             let lazy_ram = lazy_ram_unready(&verb);
             match verb.as_str() {
+                _ if lazy_ram.is_some() => format!("ERR EIO {}\n", lazy_ram.unwrap()),
                 #[cfg(all(
                     target_os = "linux",
                     target_arch = "x86_64",
@@ -2082,6 +2098,34 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) 
                     feature = "blk",
                     not(feature = "tee")
                 ))]
+                "CAPTURE_PREPARE" | "CAPTURE_QUERY" | "CAPTURE_FINISH" | "CAPTURE_CANCEL" => vmm
+                    .lock()
+                    .unwrap()
+                    .held_capture_control(&verb, _arg)
+                    .unwrap_or_else(|e| format!("ERR {e}\n")),
+                #[cfg(all(
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    feature = "blk",
+                    not(feature = "tee")
+                ))]
+                "CAPTURE_EXPORT" => {
+                    let point = vmm.lock().unwrap().held_capture_export(_arg);
+                    match point {
+                        Ok(point) => {
+                            // A partial transfer can be retried on a new connection.
+                            let _ = point.send_to(&stream);
+                            return;
+                        }
+                        Err(e) => format!("ERR {e}\n"),
+                    }
+                }
+                #[cfg(all(
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    feature = "blk",
+                    not(feature = "tee")
+                ))]
                 "STANDBY_ENTER" | "STANDBY_QUERY" | "STANDBY_WAKE" => vmm
                     .lock()
                     .unwrap()
@@ -2089,12 +2133,11 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) 
                     .unwrap_or_else(|e| format!("ERR {e}\n")),
                 #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
                 "GUEST_GATE_PREPARE" | "GUEST_GATE_QUERY" | "GUEST_GATE_RELEASE"
-                | "GUEST_GATE_ABORT" => vmm
+                | "GUEST_GATE_ABORT" | "GUEST_GATE_PARK" => vmm
                     .lock()
                     .unwrap()
                     .guest_gate_control(&verb, _arg)
                     .unwrap_or_else(|e| format!("ERR {e}\n")),
-                _ if lazy_ram.is_some() => format!("ERR EIO {}\n", lazy_ram.unwrap()),
                 #[cfg(all(
                     any(target_os = "linux", target_os = "macos"),
                     any(target_arch = "x86_64", target_arch = "aarch64"),

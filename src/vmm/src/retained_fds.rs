@@ -96,6 +96,11 @@ fn peer(stream: &UnixStream) -> io::Result<libc::ucred> {
     Ok(credentials)
 }
 
+/// Authorize local native control using the credentials attached at connect.
+pub fn local_control_peer(stream: &UnixStream) -> bool {
+    peer(stream).is_ok_and(|owner| owner.uid == 0 || owner.uid == unsafe { libc::geteuid() })
+}
+
 fn immutable_descriptor(file: &File) -> io::Result<()> {
     let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
     if flags < 0 {
@@ -365,7 +370,7 @@ pub fn receive(
     Ok(files)
 }
 
-fn send_fd(stream: &UnixStream, fd: RawFd, deadline: Instant) -> io::Result<()> {
+pub(crate) fn send_fd(stream: &UnixStream, fd: RawFd, deadline: Instant) -> io::Result<()> {
     let mut byte = b'F';
     let mut iov = libc::iovec {
         iov_base: (&mut byte as *mut u8).cast(),
