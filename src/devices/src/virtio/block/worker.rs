@@ -518,9 +518,12 @@ impl BlockWorker {
         // the worker is stopped is never read through an old accessor.
         #[cfg(not(target_os = "windows"))]
         if self.async_io.is_none() && self.lanes.is_none() {
-            match read_lanes::Lanes::new(self.disk.file.clone(), read_lanes::LANES) {
-                Ok(lanes) => self.lanes = Some(lanes),
-                Err(e) => error!("block read lanes unavailable: {e}"),
+            let count = read_lanes::configured_count();
+            if count != 0 {
+                match read_lanes::Lanes::new(self.disk.file.clone(), count) {
+                    Ok(lanes) => self.lanes = Some(lanes),
+                    Err(e) => error!("block read lanes unavailable: {e}"),
+                }
             }
         }
         #[cfg(not(target_os = "windows"))]
@@ -1547,7 +1550,26 @@ mod read_lanes {
 
     /// Reads in flight at once. A network disk scales with requests in flight
     /// (256 MB/s with one, about 2 GB/s with 16 on our workers' hyperdisk).
-    pub const LANES: usize = 16;
+    const DEFAULT_LANES: usize = 16;
+
+    pub fn configured_count() -> usize {
+        match std::env::var("KRUN_BLOCK_READ_LANES") {
+            Ok(value) => match value.parse::<usize>() {
+                Ok(count) if count <= DEFAULT_LANES => count,
+                _ => {
+                    log::warn!(
+                        "KRUN_BLOCK_READ_LANES must be an integer from 0 to {DEFAULT_LANES}"
+                    );
+                    DEFAULT_LANES
+                }
+            },
+            Err(std::env::VarError::NotPresent) => DEFAULT_LANES,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                log::warn!("KRUN_BLOCK_READ_LANES is not UTF-8");
+                DEFAULT_LANES
+            }
+        }
+    }
 
     pub struct Job {
         pub index: u16,
