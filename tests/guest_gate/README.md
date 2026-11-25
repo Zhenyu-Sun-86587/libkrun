@@ -94,3 +94,40 @@ cc -static -O2 -Wall -Wextra -Werror tests/guest_gate/identity_counter.c -o /tmp
 LD_LIBRARY_PATH="$FIRMWARE_DIR" python3 tests/guest_gate/target_probe.py "$LIBKRUN_SO" \
     --counter /tmp/identity-counter --helper "$MEASURED_HELPER"
 ```
+
+### Managed IPv4 packet gate
+
+A source with one Worker-managed TapFd must park with `GUEST_GATE_PARK_NETWORK`.
+The kernel returns the parked acknowledgement after closing packet ingress and
+egress across Guest network namespaces. A target restores the same stable
+virtio-net profile on a fresh attachment. It requires the source and target
+MAC in the SGI2 identity request to match the registered TAPs. A network-free
+target continues to use SGI1.
+
+Pass `--network` to the target probe in a private network namespace with
+CAP_NET_ADMIN, iproute2 and ping. Each host TAP intentionally stays up. The
+source kernel answers ICMP after userspace freezes and stops answering after
+network park. A target stays silent while applying its identity and answers
+at the new IP after the private activation decision. The fixture reads the
+new MAC, IPv4 address and DNS file from the resumed userspace process and
+repeats the restore across a second generation. Host-side routing, writer
+receipts and the Worker activation journal have separate integration tests.
+
+The private BEGIN packet uses opcode 1 followed by a 256-byte frame. The first
+eight bytes are `SGI2` and little-endian version 2. Bytes 8 through 191
+have the SGI1 layout. The extension has these half-open byte offsets.
+
+| Offset | Field |
+| --- | --- |
+| 192..196 | NET1 |
+| 196..200 | mode (1 native or 2 fixed), old prefix length, new prefix length, reserved zero |
+| 200..212 | old and new six-byte unicast MACs |
+| 212..232 | old IP, new IP, old gateway, new gateway, DNS server, each IPv4 in network byte order |
+| 232..248 | NUL-terminated interface name, zero padded |
+| 248..256 | reserved zero |
+
+Both the source and new attachment, kernel/helper profile, execution epoch
+and operation belong to the Worker context digest. A partial Guest update
+keeps the target held. Network configuration uses NETLINK_ROUTE and touches
+the selected Guest interface. The authority query/release binding continues
+to use the 56 bytes starting at offset 8.

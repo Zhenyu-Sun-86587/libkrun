@@ -136,6 +136,11 @@ impl Vmm {
                     a.layers,
                     spec.capacity_bytes
                 ])
+            } else if let Some((tap, profile)) = dev.tap {
+                if dev.device_id != tap.device_id {
+                    return Err("registered TAP has a different stable id".into());
+                }
+                json!(["tap", profile])
             } else if let Some(init) = dev.bootstrap_init_sha256 {
                 json!(["block-bootstrap", init])
             } else if matches!(
@@ -164,6 +169,21 @@ impl Vmm {
         Ok(bindings)
     }
 
+    fn parked_uplink(&self) -> Result<Option<devices::virtio::guest_gate::ParkedUplink>, String> {
+        let mut uplinks = self
+            .mmio_device_manager
+            .capture_inventory()?
+            .into_iter()
+            .filter_map(|d| d.tap.map(|(u, _)| u));
+        let result = uplinks.next();
+        if uplinks.next().is_some() {
+            return Err(
+                "multiple managed uplinks require a distinct network identity profile".into(),
+            );
+        }
+        Ok(result)
+    }
+
     pub(crate) fn validate_parked_target(&self, checkpoint: &VmCheckpoint) -> Result<(), String> {
         use devices::virtio::persist::DeviceSnapshot;
         let mut gates = checkpoint.devices.devices.iter().filter_map(|d| match d {
@@ -177,7 +197,13 @@ impl Vmm {
         {
             return Err("parked target device or immutable storage closure mismatch".into());
         }
-        Ok(())
+        let target_uplink = self.parked_uplink()?;
+        self.guest_gate
+            .as_ref()
+            .ok_or("missing target Guest gate")?
+            .lock()
+            .unwrap()
+            .bind_uplinks(state.uplink.as_ref(), target_uplink)
     }
 
     pub fn target_identity_request(&mut self, packet: &[u8]) -> Result<&'static str, String> {
@@ -224,7 +250,23 @@ impl Vmm {
                 .iter_mut()
                 .find(|d| matches!(d, DeviceSnapshot::GuestGate { .. }))
                 .ok_or("missing parked Guest gate transport")?;
+            let uplink = self.parked_uplink()?;
+            if self
+                .guest_gate
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .packets_parked()
+                != uplink.is_some()
+            {
+                return Err(
+                    "network capture requires a confirmed Guest packet gate and one managed TAP"
+                        .into(),
+                );
+            }
             *gate = DeviceSnapshot::ParkedGuestGate(ParkedState {
+                uplink,
                 acked_features: gate.acked_features(),
                 anchor,
                 helper,
@@ -331,8 +373,12 @@ impl Vmm {
             {
                 return Err("EBUSY Guest gate differs from the requested capture mode".into());
             }
+            let packets_parked = gate.packets_parked();
             drop(gate);
             if managed {
+                if packets_parked != self.parked_uplink()?.is_some() {
+                    return Err("ENOTSUP parked network capture needs one TAP and a confirmed Guest packet gate".into());
+                }
                 self.parked_bindings().map_err(|e| format!("ENOTSUP {e}"))?;
             }
             self.raw_profile().map_err(|e| format!("ENOTSUP {e}"))?;

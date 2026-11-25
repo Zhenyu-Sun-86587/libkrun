@@ -2195,8 +2195,12 @@ fn handle_control_stream(
                     .standby_control(&verb, _arg)
                     .unwrap_or_else(|e| format!("ERR {e}\n")),
                 #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
-                "GUEST_GATE_PREPARE" | "GUEST_GATE_QUERY" | "GUEST_GATE_RELEASE"
-                | "GUEST_GATE_ABORT" | "GUEST_GATE_PARK" => vmm
+                "GUEST_GATE_PREPARE"
+                | "GUEST_GATE_QUERY"
+                | "GUEST_GATE_RELEASE"
+                | "GUEST_GATE_ABORT"
+                | "GUEST_GATE_PARK"
+                | "GUEST_GATE_PARK_NETWORK" => vmm
                     .lock()
                     .unwrap()
                     .guest_gate_control(&verb, _arg)
