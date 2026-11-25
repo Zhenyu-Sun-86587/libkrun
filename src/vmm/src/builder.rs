@@ -1773,9 +1773,10 @@ pub fn build_microvm(
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     if vm_resources.guest_gate {
-        let gate = Arc::new(Mutex::new(
-            devices::virtio::guest_gate::GuestGate::with_helper(vm_resources.guest_identity_helper),
-        ));
+        let mut gate =
+            devices::virtio::guest_gate::GuestGate::with_helper(vm_resources.guest_identity_helper);
+        gate.provision_target(vm_resources.guest_target);
+        let gate = Arc::new(Mutex::new(gate));
         attach_mmio_device(&mut vmm, "guest-gate".into(), intc.clone(), gate.clone())
             .map_err(StartMicrovmError::RegisterGuestGate)?;
         vmm.guest_gate = Some(gate);
@@ -1984,6 +1985,19 @@ pub fn build_microvm(
     if vmm.arm_cpu_topology.is_some() {
         vmm.arm_pending_vcpus = vcpus.split_off(usize::from(vcpu_config.vcpu_count));
     }
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    if vm_resources.guest_target.is_some() {
+        let checkpoint = restore_checkpoint.as_ref().ok_or_else(|| {
+            StartMicrovmError::GuestMemoryMmap("identity target cannot cold boot".into())
+        })?;
+        vmm.validate_parked_target(checkpoint)
+            .map_err(StartMicrovmError::GuestMemoryMmap)?;
+    }
     match restore_checkpoint {
         None => {
             vmm.start_vcpus(vcpus)
@@ -2008,8 +2022,23 @@ pub fn build_microvm(
                 for _ in 0..8 {
                     let _ = event_manager.run_with_timeout(0);
                 }
-                vmm.resume().map_err(StartMicrovmError::Internal)?;
-                vmm_timing!("vcpus restored + running");
+                #[cfg(all(
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    feature = "blk",
+                    not(feature = "tee")
+                ))]
+                let wait_for_authority = vm_resources.guest_target.is_some();
+                #[cfg(not(all(
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    feature = "blk",
+                    not(feature = "tee")
+                )))]
+                let wait_for_authority = false;
+                if !wait_for_authority {
+                    vmm.resume().map_err(StartMicrovmError::Internal)?;
+                }
             }
             #[cfg(not(fork_supported))]
             {

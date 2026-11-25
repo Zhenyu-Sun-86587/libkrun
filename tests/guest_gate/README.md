@@ -55,3 +55,42 @@ by those two payloads and one SCM_RIGHTS message per sorted backing ID.
 The test closes a connection during transfer, compares repeated exports down
 to their inode numbers and seals, and checks that a cancelled capture can no
 longer be exported. An incomplete remap or capture remains held for diagnosis.
+
+### Parked identity restore
+
+For a managed standby, first prepare the measured freezer and wait for
+`armed`. Supply a separate random 128-bit capture anchor with
+`GUEST_GATE_PARK <session> <nonce> <anchor>` and wait for `parked` before
+`STANDBY_ENTER <session> <nonce> managed`. The Guest stays frozen across
+the preparation deadline. A wake becomes RUNNING after the Guest confirms
+thaw. A parked capture from standby accepts RETURN_STANDBY without advancing
+the source. Its descriptor and checkpoint can be exported through the same
+held-capture socket used for raw observation.
+
+The restricted target profile supports a Worker-provisioned read-only block
+generation, the measured virtual-only init used to pivot to that root,
+console, balloon and RNG. It validates the actual registered devices and the
+block closure while vCPUs are paused. Linux x86_64 targets bind the captured
+anchor, the helper digest and a fresh execution context to a dedicated
+AF_UNIX SOCK_SEQPACKET socket supplied by the host. The normal VMM control
+socket cannot start identity or authorize activation.
+
+Each private request occupies one packet. Byte 1 as an opcode is followed by
+the 192-byte SGI1 request, including challenge, epoch, execution context
+digest, fresh entropy, machine ID and hostname. Opcodes 2 and 3 query and
+commit activation, each followed by bytes 8 through 63 of the same request.
+The host observes `identity_ready` before committing. A failed helper remains
+`failed_held` after the authority disconnects. Completed authority replays
+cannot wake a later standby. A broader storage or network profile needs its
+own writer and attachment decisions.
+
+Run the following on an isolated KVM Worker with the matching firmware, the
+statically compiled helper and mke2fs. The probe verifies source/child
+identity separation, quarantine on failure, preservation of the original
+user process, and restoration of a grandchild after both ancestor VMMs exit.
+
+```sh
+cc -static -O2 -Wall -Wextra -Werror tests/guest_gate/identity_counter.c -o /tmp/identity-counter
+LD_LIBRARY_PATH="$FIRMWARE_DIR" python3 tests/guest_gate/target_probe.py "$LIBKRUN_SO" \
+    --counter /tmp/identity-counter --helper "$MEASURED_HELPER"
+```
