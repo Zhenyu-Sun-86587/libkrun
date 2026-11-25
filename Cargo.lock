@@ -1010,6 +1010,8 @@ dependencies = [
  "log",
  "nitro-enclaves 0.5.0",
  "once_cell",
+ "serde",
+ "serde_json",
  "vm-memory",
  "windows-sys 0.61.2",
 ]

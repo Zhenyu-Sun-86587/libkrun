@@ -301,6 +301,18 @@ struct krun_managed_block_v1 {
 int32_t krun_attach_block_set_v1(uint32_t ctx_id,
                                   const struct krun_managed_block_v1 *specs,
                                   size_t count);
+
+#if defined(__x86_64__)
+/* Supply the private Worker endpoint and the execution scope for held block
+ * pivots. The UTF-8 JSON fields are socket, worker_uid, bundle_digest,
+ * instance_id, incarnation_id and execution_epoch. This requires the native
+ * held control socket and the managed block set. The VMM exchanges Worker
+ * Resource requests and original writer FDs from its own registered PID.
+ */
+int32_t krun_configure_worker_block_pivot_v1(uint32_t ctx_id,
+                                              const uint8_t *config,
+                                              size_t config_len);
+#endif
 #endif
 
 /**

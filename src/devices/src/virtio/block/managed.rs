@@ -1,7 +1,7 @@
 // Copyright 2026. SPDX-License-Identifier: Apache-2.0
 //! Block devices with an explicit Worker-owned closure of open files.
 
-use super::device::{DiskBackend, DiskProperties, disk_backend};
+use super::device::{DiskBackend, DiskProperties, PreparedDiskPivot, disk_backend};
 use super::{Block, BlockIoEngine, CacheType, ImageType, SECTOR_SIZE, SyncMode};
 use imago::{DynStorage, FormatAccess, Storage, file::File as ImageFile, qcow2::Qcow2, raw::Raw};
 use std::collections::HashSet;
@@ -23,6 +23,12 @@ pub struct ManagedAttachment {
     pub execution_epoch: u64,
     pub capacity_bytes: u64,
     pub layers: Vec<String>,
+}
+
+pub(crate) struct ManagedDiskState {
+    attachment: ManagedAttachment,
+    writer: Option<File>,
+    identities: Vec<(u64, u64)>,
 }
 
 pub struct ManagedLayer {
@@ -48,9 +54,10 @@ fn disk_format(format: ImageType) -> io::Result<&'static str> {
     }
 }
 
-fn validate_layers(layers: &[ManagedLayer], writable: bool) -> io::Result<()> {
+fn validate_layers(layers: &[ManagedLayer], writable: bool) -> io::Result<Vec<(u64, u64)>> {
     let mut identities = HashSet::new();
     let mut resource_ids = HashSet::new();
+    let mut ordered = Vec::new();
     for (index, layer) in layers.iter().enumerate() {
         let meta = layer.file.metadata()?;
         let flags = unsafe { libc::fcntl(layer.file.as_raw_fd(), libc::F_GETFL) };
@@ -70,8 +77,9 @@ fn validate_layers(layers: &[ManagedLayer], writable: bool) -> io::Result<()> {
                 "managed block layer has an invalid file, access or identity",
             ));
         }
+        ordered.push((meta.dev(), meta.ino()));
     }
-    Ok(())
+    Ok(ordered)
 }
 
 fn read_only_backing(layer: ManagedLayer, backing: Backing) -> io::Result<ImageAccess> {
@@ -140,11 +148,8 @@ fn open_layers(layers: Vec<ManagedLayer>, writable: bool) -> io::Result<(Arc<Dis
     Ok((backend, discard))
 }
 
-impl Block {
-    pub fn from_managed_fds(
-        attachment: ManagedAttachment,
-        layers: Vec<ManagedLayer>,
-    ) -> io::Result<Self> {
+impl ManagedDiskState {
+    fn prepare(attachment: ManagedAttachment, layers: &[ManagedLayer]) -> io::Result<Self> {
         let writable = attachment.writable_head_id.is_some();
         let top = layers
             .first()
@@ -173,16 +178,37 @@ impl Block {
                 "block attachment does not match its managed closure",
             ));
         }
-        validate_layers(&layers, writable)?;
+        let identities = validate_layers(layers, writable)?;
+        let writer = if writable {
+            Some(top.file.try_clone()?)
+        } else {
+            None
+        };
+        Ok(Self {
+            attachment,
+            writer,
+            identities,
+        })
+    }
+}
+
+impl Block {
+    pub fn from_managed_fds(
+        attachment: ManagedAttachment,
+        layers: Vec<ManagedLayer>,
+    ) -> io::Result<Self> {
+        let state = ManagedDiskState::prepare(attachment, &layers)?;
+        let writable = state.writer.is_some();
+        let top = &layers[0];
         let image_id = DiskProperties::build_disk_image_id(&top.file);
         let (backend, discard) = open_layers(layers, writable)?;
-        if backend.size() != attachment.capacity_bytes {
+        if backend.size() != state.attachment.capacity_bytes {
             return Err(invalid("block image capacity differs from the attachment"));
         }
         let cache = CacheType::Writeback;
         let disk = DiskProperties::new(backend.clone(), image_id.clone(), cache)?;
         let mut block = Self::from_opened_disk(
-            attachment.device_id.clone(),
+            state.attachment.device_id.clone(),
             None,
             cache,
             backend,
@@ -194,11 +220,74 @@ impl Block {
             SyncMode::Full,
             BlockIoEngine::Sync,
         )?;
-        block.managed_attachment = Some(attachment);
+        block.managed_disk = Some(state);
         Ok(block)
     }
 
     pub fn managed_attachment(&self) -> Option<&ManagedAttachment> {
-        self.managed_attachment.as_ref()
+        self.managed_disk.as_ref().map(|state| &state.attachment)
+    }
+
+    pub fn managed_backing_identities(&self) -> Option<&[(u64, u64)]> {
+        self.managed_disk
+            .as_ref()
+            .map(|state| state.identities.as_slice())
+    }
+
+    pub fn managed_writer(&self) -> io::Result<Option<File>> {
+        self.managed_disk
+            .as_ref()
+            .and_then(|state| state.writer.as_ref())
+            .map(File::try_clone)
+            .transpose()
+    }
+
+    pub fn prepare_managed_live_pivot(
+        &self,
+        attachment: ManagedAttachment,
+        layers: Vec<ManagedLayer>,
+    ) -> io::Result<PreparedDiskPivot> {
+        let current = self
+            .managed_disk
+            .as_ref()
+            .ok_or_else(|| invalid("block is missing its installed managed attachment"))?;
+        let old = &current.attachment;
+        if self.is_read_only() || !self.managed_pivot_ready() {
+            return Err(invalid(
+                "managed block must be writable, drained and have a clean flush",
+            ));
+        }
+        let state = ManagedDiskState::prepare(attachment, &layers)?;
+        let next = &state.attachment;
+        if next.device_id != old.device_id
+            || next.attachment_id != old.attachment_id
+            || next.role != old.role
+            || next.volume_id != old.volume_id
+            || next.execution_epoch != old.execution_epoch
+            || next.capacity_bytes != old.capacity_bytes
+            || next.grant_id == old.grant_id
+            || next.writable_head_id.is_none()
+            || next.layers.get(1..) != Some(old.layers.as_slice())
+            || state.identities.get(1..) != Some(current.identities.as_slice())
+            || current.identities.contains(&state.identities[0])
+        {
+            return Err(invalid(
+                "managed pivot does not extend the exact current block closure",
+            ));
+        }
+        let (disk_image, _) = open_layers(layers, true)?;
+        if disk_image.size() != old.capacity_bytes {
+            return Err(invalid("managed pivot changes the disk capacity"));
+        }
+        let disk = DiskProperties::new(
+            disk_image.clone(),
+            self.disk_identity().to_vec(),
+            CacheType::Writeback,
+        )?;
+        Ok(PreparedDiskPivot {
+            disk,
+            disk_image,
+            managed_disk: Some(state),
+        })
     }
 }
