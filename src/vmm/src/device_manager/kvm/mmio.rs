@@ -9,6 +9,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
+#[cfg(all(target_arch = "x86_64", feature = "blk", not(feature = "tee")))]
+use crate::managed_block_pivot::{
+    ManagedBlockInventory, ManagedBlockPivot, ManagedBlockPivotError, ManagedBlockTarget,
+};
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use devices::fdt::DeviceInfoForFDT;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -740,6 +744,139 @@ impl MMIODeviceManager {
         }
     }
 
+    #[cfg(all(target_arch = "x86_64", feature = "blk", not(feature = "tee")))]
+    pub(crate) fn managed_block_inventory(
+        &self,
+    ) -> std::result::Result<Vec<ManagedBlockInventory>, ManagedBlockPivotError> {
+        let mut devices = Vec::new();
+        for device in &self.virtio_devices {
+            let guard = device.lock().unwrap();
+            if let Some(block) = guard.as_any().downcast_ref::<devices::virtio::Block>() {
+                let attachment = block.managed_attachment().ok_or_else(|| {
+                    ManagedBlockPivotError::Refused(format!(
+                        "block '{}' is not managed",
+                        block.id()
+                    ))
+                })?;
+                let writer = block
+                    .managed_writer()
+                    .map_err(|error| ManagedBlockPivotError::Refused(error.to_string()))?;
+                devices.push(ManagedBlockInventory {
+                    attachment: attachment.clone(),
+                    writer,
+                });
+            }
+        }
+        devices.sort_unstable_by(|a, b| a.attachment.device_id.cmp(&b.attachment.device_id));
+        Ok(devices)
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "blk", not(feature = "tee")))]
+    pub(crate) fn pivot_managed_blocks(
+        &self,
+        targets: Vec<ManagedBlockTarget>,
+    ) -> std::result::Result<ManagedBlockPivot, ManagedBlockPivotError> {
+        use std::collections::{BTreeMap, HashSet};
+        use std::os::unix::fs::MetadataExt;
+        let refuse = ManagedBlockPivotError::Refused;
+        let count = targets.len();
+        let mut requested: BTreeMap<_, _> = targets
+            .into_iter()
+            .map(|target| (target.attachment.device_id.clone(), target))
+            .collect();
+        if count == 0 || count != requested.len() {
+            return Err(refuse(
+                "managed pivot requires one target per writable block device".into(),
+            ));
+        }
+        let grant = requested
+            .values()
+            .next()
+            .and_then(|target| target.attachment.grant_id.clone());
+        if grant.is_none()
+            || requested
+                .values()
+                .any(|target| target.attachment.grant_id != grant)
+        {
+            return Err(refuse(
+                "managed pivot requires one replacement writer grant".into(),
+            ));
+        }
+        let mut current = HashSet::new();
+        for device in &self.virtio_devices {
+            let guard = device.lock().unwrap();
+            if let Some(block) = guard.as_any().downcast_ref::<devices::virtio::Block>() {
+                let identities = block
+                    .managed_backing_identities()
+                    .ok_or_else(|| refuse(format!("block '{}' is not managed", block.id())))?;
+                current.extend(identities.iter().copied());
+            }
+        }
+        for target in requested.values() {
+            let meta = target
+                .layers
+                .first()
+                .ok_or_else(|| refuse("empty managed pivot target".into()))?
+                .file
+                .metadata()
+                .map_err(|error| refuse(error.to_string()))?;
+            if !current.insert((meta.dev(), meta.ino())) {
+                return Err(refuse(
+                    "managed pivot target aliases a current or replacement image".into(),
+                ));
+            }
+        }
+        let mut prepared = Vec::new();
+        for device in &self.virtio_devices {
+            let guard = device.lock().unwrap();
+            let Some(block) = guard.as_any().downcast_ref::<devices::virtio::Block>() else {
+                continue;
+            };
+            if block.is_read_only() {
+                continue;
+            }
+            let target = requested.remove(block.id()).ok_or_else(|| {
+                refuse(format!(
+                    "missing target for writable block '{}'",
+                    block.id()
+                ))
+            })?;
+            let pivot = block
+                .prepare_managed_live_pivot(target.attachment, target.layers)
+                .map_err(|error| refuse(format!("prepare block '{}': {error}", block.id())))?;
+            prepared.push((Arc::clone(device), pivot));
+        }
+        if !requested.is_empty() {
+            return Err(refuse(
+                "managed pivot contains a target for an absent or read-only device".into(),
+            ));
+        }
+        let mut rollback = BlockPivotsRollback { pivots: Vec::new() };
+        for (device, target) in prepared {
+            let result = {
+                let mut guard = device.lock().unwrap();
+                let block = guard
+                    .as_mut_any()
+                    .downcast_mut::<devices::virtio::Block>()
+                    .expect("prepared block changed type");
+                block.apply_live_disk_pivot(target)
+            };
+            match result {
+                Ok(source) => rollback.pivots.push((device, source)),
+                Err(error) => {
+                    return Err(match self.rollback_block_pivots(rollback) {
+                        Ok(()) => refuse(format!("apply block pivot: {error}")),
+                        Err(rollback) => ManagedBlockPivotError::RollbackFailed {
+                            apply: error.to_string(),
+                            rollback,
+                        },
+                    });
+                }
+            }
+        }
+        Ok(ManagedBlockPivot(Some(rollback)))
+    }
+
     /// Restore existing quiesced devices from [`Self::snapshot_devices`],
     /// matching each transport once in its original registration order.
     pub fn restore_devices(&self, state: &VmDevicesState) -> std::result::Result<(), String> {
@@ -786,6 +923,140 @@ mod tests {
     use vm_memory::{GuestAddress, GuestMemoryMmap};
 
     const QUEUE_CONFIG: &[QueueConfig] = &[QueueConfig::new(64)];
+
+    #[cfg(all(target_arch = "x86_64", feature = "blk", not(feature = "tee")))]
+    #[test]
+    fn managed_pivot_prepares_every_block_and_rolls_back_real_workers() {
+        use devices::virtio::block::managed::{ManagedAttachment, ManagedLayer};
+        use devices::virtio::block::{Block, ImageType, create_overlay};
+        use std::fs::{File, OpenOptions};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut mmio_base = 0x1000;
+        let mut manager = MMIODeviceManager::new(&mut mmio_base, (4, 25));
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 256 * 1024)]).unwrap();
+        let capacity = 1024 * 1024;
+        let mut originals = Vec::new();
+        let mut make_target = Vec::new();
+        for name in ["storage", "data"] {
+            let original = dir.path().join(format!("{name}-raw"));
+            let successor = dir.path().join(format!("{name}-qcow2"));
+            let old_name = original.to_str().unwrap();
+            let new_name = successor.to_str().unwrap();
+            let old = File::create_new(&original).unwrap();
+            old.set_len(capacity).unwrap();
+            let old_id = old.metadata().unwrap().ino();
+            drop(old);
+            create_overlay(new_name, old_name, ImageType::Raw).unwrap();
+            let attachment = ManagedAttachment {
+                attachment_id: name.into(),
+                device_id: name.into(),
+                role: name.into(),
+                volume_id: name.into(),
+                generation_id: old_name.into(),
+                writable_head_id: Some(old_name.into()),
+                grant_id: Some("original-grant".into()),
+                execution_epoch: 1,
+                capacity_bytes: capacity,
+                layers: vec![old_name.into()],
+            };
+            let opened = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&original)
+                .unwrap();
+            let mut block = Block::from_managed_fds(
+                attachment.clone(),
+                vec![ManagedLayer {
+                    resource_id: old_name.into(),
+                    format: ImageType::Raw,
+                    file: opened,
+                }],
+            )
+            .unwrap();
+            block
+                .activate(
+                    memory.clone(),
+                    InterruptTransport::new(DummyIrqChip::new().into(), name.into()).unwrap(),
+                    vec![DeviceQueue::new(
+                        devices::virtio::Queue::new(64),
+                        Arc::new(utils::eventfd::EventFd::new(0).unwrap()),
+                    )],
+                )
+                .unwrap();
+            manager.virtio_devices.push(Arc::new(Mutex::new(block)));
+            let mut next = attachment;
+            next.grant_id = Some("replacement-grant".into());
+            next.writable_head_id = Some(new_name.into());
+            next.layers.insert(0, new_name.into());
+            let new_id = File::open(&successor).unwrap().metadata().unwrap().ino();
+            originals.push((name, old_id, new_id));
+            make_target.push(
+                move |original_alias: Option<&std::path::Path>| ManagedBlockTarget {
+                    attachment: next.clone(),
+                    layers: vec![
+                        ManagedLayer {
+                            resource_id: next.layers[0].clone(),
+                            format: ImageType::Qcow2,
+                            file: OpenOptions::new()
+                                .read(true)
+                                .write(true)
+                                .open(&successor)
+                                .unwrap(),
+                        },
+                        ManagedLayer {
+                            resource_id: next.layers[1].clone(),
+                            format: ImageType::Raw,
+                            file: File::open(original_alias.unwrap_or(&original)).unwrap(),
+                        },
+                    ],
+                },
+            );
+        }
+        let rogue = dir.path().join("rogue");
+        File::create_new(&rogue).unwrap().set_len(capacity).unwrap();
+        let writers = |replacement: bool| {
+            let inventory = manager.managed_block_inventory().unwrap();
+            for item in inventory {
+                let writer = item.writer.unwrap();
+                let (_, original, successor) = originals
+                    .iter()
+                    .find(|entry| entry.0 == item.attachment.device_id)
+                    .unwrap();
+                assert_eq!(
+                    writer.metadata().unwrap().ino(),
+                    if replacement { *successor } else { *original }
+                );
+                assert_ne!(
+                    unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                    0
+                );
+            }
+        };
+        manager.quiesce_devices();
+        manager.validate_snapshot_boundary().unwrap();
+        assert!(
+            manager
+                .pivot_managed_blocks(vec![make_target[0](None), make_target[1](Some(&rogue))])
+                .is_err()
+        );
+        writers(false);
+        let mut token = manager
+            .pivot_managed_blocks(vec![make_target[0](None), make_target[1](None)])
+            .unwrap();
+        writers(true);
+        manager
+            .rollback_block_pivots(token.0.take().unwrap())
+            .unwrap();
+        writers(false);
+        let token = manager
+            .pivot_managed_blocks(vec![make_target[0](None), make_target[1](None)])
+            .unwrap();
+        token.commit();
+        writers(true);
+    }
 
     impl MMIODeviceManager {
         fn register_virtio_device(

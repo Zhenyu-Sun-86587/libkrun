@@ -462,6 +462,10 @@ mod tests {
 
     fn default_vm_resources() -> VmResources {
         VmResources {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+            guest_gate: false,
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+            guest_identity_helper: None,
             live_cpu_growth: false,
             live_memory_growth: false,
             vm_config: VmConfig::default(),

@@ -422,7 +422,7 @@ pub struct Block {
     pub(crate) id: String,
     pub(crate) partuuid: Option<String>,
     #[cfg(target_os = "linux")]
-    pub(crate) managed_attachment: Option<super::managed::ManagedAttachment>,
+    pub(crate) managed_disk: Option<super::managed::ManagedDiskState>,
 }
 
 /// A replacement backing image opened and validated before a live block pivot.
@@ -430,14 +430,18 @@ pub struct Block {
 /// This is intentionally opaque outside the block implementation. Preparing
 /// every device first lets the VMM fail without changing any running device.
 pub struct PreparedDiskPivot {
-    disk: DiskProperties,
-    disk_image: Arc<DiskBackend>,
+    pub(super) disk: DiskProperties,
+    pub(super) disk_image: Arc<DiskBackend>,
+    #[cfg(target_os = "linux")]
+    pub(super) managed_disk: Option<super::managed::ManagedDiskState>,
 }
 
 /// The previous backing retained until a live block pivot is committed.
 pub struct DiskPivotRollback {
     disk: DiskProperties,
     disk_image: Arc<DiskBackend>,
+    #[cfg(target_os = "linux")]
+    managed_disk: Option<super::managed::ManagedDiskState>,
 }
 
 /// Open `path` as the given image format, returning the format accessor together
@@ -752,7 +756,7 @@ impl Block {
             quiesced_worker: None,
             snapshot_error: None,
             #[cfg(target_os = "linux")]
-            managed_attachment: None,
+            managed_disk: None,
         })
     }
 
@@ -772,7 +776,7 @@ impl Block {
     /// Filesystem growth inside the guest is a separate, subsequent operation.
     pub fn grow(&mut self, bytes: u64) -> io::Result<()> {
         #[cfg(target_os = "linux")]
-        if self.managed_attachment.is_some() {
+        if self.managed_disk.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "managed disk growth requires a Worker operation",
@@ -830,7 +834,7 @@ impl Block {
         format: ImageType,
     ) -> io::Result<PreparedDiskPivot> {
         #[cfg(target_os = "linux")]
-        if self.managed_attachment.is_some() {
+        if self.managed_disk.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "managed disk pivot requires authorized handles",
@@ -894,7 +898,25 @@ impl Block {
                 ),
             ));
         }
-        Ok(PreparedDiskPivot { disk, disk_image })
+        Ok(PreparedDiskPivot {
+            disk,
+            disk_image,
+            #[cfg(target_os = "linux")]
+            managed_disk: None,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn managed_pivot_ready(&self) -> bool {
+        self.device_state.is_activated()
+            && self.worker_thread.is_none()
+            && self.quiesced_worker.is_some()
+            && self.snapshot_error.is_none()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn disk_identity(&self) -> &[u8] {
+        &self.disk_image_id
     }
 
     /// Atomically replace this quiesced device's backing image.
@@ -916,6 +938,8 @@ impl Block {
         Ok(DiskPivotRollback {
             disk: old_disk,
             disk_image: old_disk_image,
+            #[cfg(target_os = "linux")]
+            managed_disk: std::mem::replace(&mut self.managed_disk, prepared.managed_disk),
         })
     }
 
@@ -932,6 +956,10 @@ impl Block {
         })?;
         let _discarded_new_disk = worker.replace_disk(rollback.disk);
         self.disk_image = rollback.disk_image;
+        #[cfg(target_os = "linux")]
+        {
+            self.managed_disk = rollback.managed_disk;
+        }
         Ok(())
     }
 }
