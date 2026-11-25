@@ -2008,6 +2008,13 @@ pub fn build_microvm(
         })?;
         vmm.validate_parked_target(checkpoint)
             .map_err(StartMicrovmError::GuestMemoryMmap)?;
+        if let Some(vsock) = vm_resources.vsock.get() {
+            vsock
+                .lock()
+                .unwrap()
+                .defer_parked_backend()
+                .map_err(StartMicrovmError::GuestMemoryMmap)?;
+        }
     }
     match restore_checkpoint {
         None => {

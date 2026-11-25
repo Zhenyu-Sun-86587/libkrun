@@ -100,7 +100,8 @@ impl Vsock {
         }
         // The driver refills the event queue after handling an event, so this
         // kick means a posted transport reset has been handled.
-        if std::mem::take(&mut self.awaiting_transport_reset_ack) {
+        if self.awaiting_transport_reset_ack && self.parked_reset_acknowledged() {
+            self.awaiting_transport_reset_ack = false;
             self.muxer.release_rx_after_transport_reset();
             // The TX kick may already have been consumed while reset held RX.
             // Drain both directions without waiting for another guest packet.

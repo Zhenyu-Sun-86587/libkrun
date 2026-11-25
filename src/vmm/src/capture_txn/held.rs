@@ -171,6 +171,8 @@ impl Vmm {
                 json!(["tap", profile])
             } else if let Some(init) = dev.bootstrap_init_sha256 {
                 json!(["block-bootstrap", init])
+            } else if let Some(vsock) = dev.vsock_binding {
+                json!(["unix-ipc-v1", vsock])
             } else if matches!(
                 dev.virtio_type,
                 TYPE_RNG | TYPE_CONSOLE | TYPE_BALLOON | DEVICE_TYPE
@@ -239,6 +241,41 @@ impl Vmm {
             }
             if wanted[1].as_u64() == Some(devices::virtio::TYPE_BLOCK as u64) {
                 let _ = verify_parked_block_binding(&wanted[5], &actual[5])?;
+            } else if wanted[1].as_u64() == Some(19) {
+                type Binding = (u64, Vec<(u32, bool, String)>);
+                let (before_tag, before): (String, Binding) =
+                    serde_json::from_value(wanted[5].clone())
+                        .map_err(|_| "malformed parked source vsock binding")?;
+                let (after_tag, after): (String, Binding) =
+                    serde_json::from_value(actual[5].clone())
+                        .map_err(|_| "malformed parked target vsock binding")?;
+                if before_tag != "unix-ipc-v1"
+                    || after_tag != before_tag
+                    || before.0 == after.0
+                    || !before
+                        .1
+                        .iter()
+                        .map(|(port, listen, _)| (port, listen))
+                        .eq(after.1.iter().map(|(port, listen, _)| (port, listen)))
+                    || before
+                        .1
+                        .iter()
+                        .any(|(_, _, endpoint)| after.1.iter().any(|(_, _, new)| endpoint == new))
+                {
+                    return Err("parked target needs independent vsock endpoints and CID".into());
+                }
+                let snapshot = checkpoint
+                    .devices
+                    .devices
+                    .iter()
+                    .find_map(|device| match device {
+                        DeviceSnapshot::Vsock(state) => Some(state),
+                        _ => None,
+                    })
+                    .ok_or("missing parked vsock ring state")?;
+                if snapshot.cid != before.0 || !snapshot.parked_rebind {
+                    return Err("source vsock was not fenced at the parked cut".into());
+                }
             } else if wanted[5] != actual[5] {
                 return Err("parked target device slot or descriptor mismatch".into());
             }
@@ -268,6 +305,14 @@ impl Vmm {
             self.resume()
                 .map_err(|e| format!("identity-stage resume: {e}"))?;
         }
+        if result == "released"
+            && self
+                .mmio_device_manager
+                .with_vsock(|vsock| vsock.publish_parked_backend())?
+                == Some(false)
+        {
+            return Ok("activating");
+        }
         Ok(result)
     }
 
@@ -275,6 +320,10 @@ impl Vmm {
         self.mmio_device_manager.quiesce_devices();
         self.devices_quiesced = true;
         self.mmio_device_manager.validate_standby_boundary()?;
+        if managed {
+            self.mmio_device_manager
+                .with_vsock(|vsock| vsock.fence_parked_source())?;
+        }
         let inventory = self.mmio_device_manager.capture_inventory()?;
         let vcpu_states = self.save_vcpu_states().map_err(|e| e.to_string())?;
         if vcpu_states.iter().any(|v| v.runs_nested_guest()) {

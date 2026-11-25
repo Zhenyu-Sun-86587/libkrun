@@ -70,6 +70,9 @@ pub struct Vsock {
     pub(crate) awaiting_transport_reset_ack: bool,
     /// Listener metadata captured after host handlers and RX producers stop.
     quiesced_listeners: Option<Vec<ListenerDesc>>,
+    reset_source_on_resume: bool,
+    defer_parked_backend: bool,
+    parked_reset_refill: Option<u16>,
 }
 
 impl Vsock {
@@ -112,6 +115,9 @@ impl Vsock {
             pending_transport_reset: false,
             awaiting_transport_reset_ack: false,
             quiesced_listeners: None,
+            reset_source_on_resume: false,
+            defer_parked_backend: false,
+            parked_reset_refill: None,
         })
     }
 
@@ -121,6 +127,144 @@ impl Vsock {
 
     pub fn cid(&self) -> u64 {
         self.cid
+    }
+
+    pub fn parked_binding(&self) -> Option<(u64, Vec<(u32, bool, String)>)> {
+        Some((self.cid, self.muxer.parked_ports()?))
+    }
+
+    pub fn defer_parked_backend(&mut self) -> Result<(), String> {
+        if self.is_activated() || self.parked_binding().is_none() {
+            return Err("parked vsock requires a fresh Unix IPC device".into());
+        }
+        self.defer_parked_backend = true;
+        Ok(())
+    }
+
+    /// The parked Guest and the muxer are already quiesced. No source host
+    /// socket or queued TX may survive this capture boundary.
+    #[cfg(target_os = "linux")]
+    pub fn fence_parked_source(&mut self) -> Result<(), String> {
+        if self.parked_binding().is_none()
+            || self.quiesced_listeners.is_none()
+            || self.awaiting_transport_reset_ack
+        {
+            return Err("vsock is not quiesced with the Unix IPC rebind profile".into());
+        }
+        let DeviceState::Activated(ref mem, _) = self.device_state else {
+            return Err("parked source vsock is inactive".into());
+        };
+        let mut events = self
+            .queue_ev
+            .as_ref()
+            .ok_or("parked vsock has no event queue")?
+            .lock()
+            .unwrap();
+        let reset = events
+            .pop(mem)
+            .ok_or("parked vsock has no transport reset buffer")?;
+        let writable =
+            reset.is_write_only() && reset.len >= 4 && mem.read_obj::<u32>(reset.addr).is_ok();
+        events.undo_pop();
+        drop(events);
+        if !writable {
+            return Err("parked vsock has an invalid transport reset buffer".into());
+        }
+        self.discard_parked_tx()?;
+        self.reset_source_on_resume = true;
+        self.muxer.fence_parked_peers()
+    }
+
+    fn discard_parked_tx(&self) -> Result<bool, String> {
+        let DeviceState::Activated(ref mem, _) = self.device_state else {
+            return Err("parked vsock has no active memory".into());
+        };
+        let mut tx = self
+            .queue_tx
+            .as_ref()
+            .ok_or("parked vsock has no TX queue")?
+            .lock()
+            .unwrap();
+        let mut used = false;
+        while let Some(head) = tx.pop(mem) {
+            tx.add_used(mem, head.index, 0)
+                .map_err(|e| format!("retire parked vsock TX buffer: {e:?}"))?;
+            used = true;
+        }
+        if !tx.is_empty(mem) {
+            return Err("cannot retire invalid parked vsock TX buffers".into());
+        }
+        Ok(used)
+    }
+
+    fn post_parked_reset(&mut self) -> Result<(), String> {
+        let DeviceState::Activated(ref mem, _) = self.device_state else {
+            return Err("parked vsock is inactive".into());
+        };
+        let expected = self
+            .queue_ev
+            .as_ref()
+            .ok_or("parked vsock has no event queue")?
+            .lock()
+            .unwrap()
+            .len(mem);
+        self.muxer.hold_rx_for_transport_reset();
+        if expected == 0 || !self.send_transport_reset() {
+            return Err("cannot post the parked vsock transport reset".into());
+        }
+        self.parked_reset_refill = Some(expected);
+        self.awaiting_transport_reset_ack = true;
+        self.device_state.signal_used_queue();
+        Ok(())
+    }
+
+    pub(crate) fn parked_reset_acknowledged(&mut self) -> bool {
+        let Some(expected) = self.parked_reset_refill else {
+            return true;
+        };
+        let DeviceState::Activated(ref mem, _) = self.device_state else {
+            return false;
+        };
+        if self
+            .queue_ev
+            .as_ref()
+            .is_none_or(|q| q.lock().unwrap().len(mem) < expected)
+        {
+            return false;
+        }
+        self.parked_reset_refill = None;
+        if !self.defer_parked_backend {
+            self.muxer.rearm_after_snapshot();
+        }
+        true
+    }
+
+    /// Open the target's own peer mappings only after the identity commit and
+    /// the Guest driver has consumed the transport reset.
+    pub fn publish_parked_backend(&mut self) -> Result<bool, String> {
+        if !self.defer_parked_backend {
+            return Ok(true);
+        }
+        if self.awaiting_transport_reset_ack && self.parked_reset_acknowledged() {
+            self.awaiting_transport_reset_ack = false;
+            self.muxer.release_rx_after_transport_reset();
+        }
+        if self.awaiting_transport_reset_ack || self.pending_transport_reset {
+            return Ok(false);
+        }
+        if self.discard_parked_tx()? {
+            self.device_state.signal_used_queue();
+        }
+        let DeviceState::Activated(ref mem, ref irq) = self.device_state else {
+            return Err("parked vsock target is inactive".into());
+        };
+        let rx = self
+            .queue_rx
+            .clone()
+            .ok_or("parked vsock target has no RX queue")?;
+        self.muxer.activate(mem.clone(), rx, irq.clone(), true)?;
+        self.defer_parked_backend = false;
+        Ok(true)
     }
 
     /// Walk the driver-provided RX queue buffers and attempt to fill them up with any data that we
@@ -135,7 +279,7 @@ impl Vsock {
         };
 
         let mut have_used = false;
-        if self.muxer.rx_held_for_transport_reset() {
+        if self.defer_parked_backend || self.muxer.rx_held_for_transport_reset() {
             return have_used;
         }
 
@@ -180,6 +324,12 @@ impl Vsock {
     /// them. Return `true` if descriptors have been added to the used ring, and `false` otherwise.
     pub fn process_stream_tx(&mut self) -> bool {
         debug!("process_stream_tx()");
+        if self.defer_parked_backend || self.parked_reset_refill.is_some() {
+            return self.discard_parked_tx().unwrap_or_else(|err| {
+                error!("{err}");
+                false
+            });
+        }
         // A TX reply can enter the held RX gate. Blocking here would prevent
         // this same event loop from handling the guest's reset acknowledgement.
         // Keep descriptors queued; the acknowledgement explicitly drains them.
@@ -274,6 +424,8 @@ pub struct VsockState {
     /// `#[serde(default)]` keeps older snapshots (without this field) loadable.
     #[serde(default)]
     pub listeners: Vec<ListenerDesc>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parked_rebind: bool,
 }
 
 impl VsockState {
@@ -310,6 +462,7 @@ impl Vsock {
                 .quiesced_listeners
                 .clone()
                 .unwrap_or_else(|| self.muxer.snapshot_listeners()),
+            parked_rebind: self.reset_source_on_resume,
         }
     }
 
@@ -317,6 +470,17 @@ impl Vsock {
     /// connections are reset; saved TSI listeners are recreated before resume.
     pub fn restore_state(&mut self, state: &VsockState) -> Result<(), String> {
         state.validate_host_network(self.muxer.host_network_enabled())?;
+        if state.parked_rebind != self.defer_parked_backend
+            || state.parked_rebind
+                && (!state.activated
+                    || state.cid == self.cid
+                    || state.queue_rx.is_none()
+                    || state.queue_tx.is_none()
+                    || state.queue_ev.is_none()
+                    || !state.listeners.is_empty())
+        {
+            return Err("parked vsock checkpoint has no compatible fresh backend".into());
+        }
         self.acked_features = state.acked_features;
         // `cid` left as constructed (fresh on fork, matching on restore).
         if let (Some(m), Some(qs)) = (self.queue_rx.as_ref(), state.queue_rx.as_ref()) {
@@ -402,8 +566,16 @@ impl VirtioDevice for Vsock {
     }
 
     fn rearm_after_snapshot(&mut self) {
-        self.muxer.rearm_after_snapshot();
         self.quiesced_listeners = None;
+        if std::mem::take(&mut self.reset_source_on_resume) {
+            if let Err(error) = self.post_parked_reset() {
+                error!("cannot rearm parked source vsock: {error}");
+            }
+            // The source listener resumes once the driver has consumed reset.
+            // No new peer may queue data against the old guest connections.
+            return;
+        }
+        self.muxer.rearm_after_snapshot();
     }
 
     fn avail_features(&self) -> u64 {
@@ -419,6 +591,9 @@ impl VirtioDevice for Vsock {
             self.muxer.restore_listeners(listeners)?;
         }
         if std::mem::take(&mut self.pending_transport_reset) {
+            if self.defer_parked_backend {
+                return self.post_parked_reset();
+            }
             if self.send_transport_reset() {
                 self.awaiting_transport_reset_ack = true;
                 self.muxer.arm_transport_reset_timeout(
@@ -513,11 +688,19 @@ impl VirtioDevice for Vsock {
         self.queue_ev = Some(Arc::new(Mutex::new(ev_queue)));
         self.queue_tx = Some(Arc::new(Mutex::new(tx_queue)));
         self.queue_rx = Some(Arc::new(Mutex::new(rx_queue)));
-        self.muxer.activate(
-            mem.clone(),
-            self.queue_rx.clone().unwrap(),
-            interrupt.clone(),
-        );
+        if !self.defer_parked_backend {
+            self.muxer
+                .activate(
+                    mem.clone(),
+                    self.queue_rx.clone().unwrap(),
+                    interrupt.clone(),
+                    false,
+                )
+                .map_err(|error| {
+                    error!("start vsock backend: {error}");
+                    ActivateError::BadActivate
+                })?;
+        }
 
         self.device_state = DeviceState::Activated(mem, interrupt);
 

@@ -624,6 +624,25 @@ impl MMIODeviceManager {
         Ok(())
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    pub(crate) fn with_vsock<T>(
+        &self,
+        apply: impl FnOnce(&mut devices::virtio::Vsock) -> std::result::Result<T, String>,
+    ) -> std::result::Result<Option<T>, String> {
+        for device in &self.virtio_devices {
+            let mut guard = device.lock().unwrap();
+            if let Some(vsock) = guard.as_mut_any().downcast_mut::<devices::virtio::Vsock>() {
+                return apply(vsock).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
     /// Re-arm every virtio device quiesced by [`Self::quiesce_devices`]
     /// (restarts block/net workers from their current/restored queue indices).
     pub fn rearm_devices(&self) {
