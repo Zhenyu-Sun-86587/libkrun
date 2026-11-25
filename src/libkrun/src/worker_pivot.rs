@@ -30,6 +30,16 @@ pub(super) struct Config {
     execution_epoch: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RestoreScope {
+    operation_id: String,
+    request_digest: String,
+    source_pivot_id: String,
+    grant_id: String,
+    expected_revision: i64,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Command {
@@ -129,7 +139,7 @@ impl Config {
     fn request(
         &self,
         method: &str,
-        command: &Command,
+        scope: (&str, &str),
         payload: Value,
         table: &[Entry],
         fds: &[File],
@@ -140,7 +150,7 @@ impl Config {
                 "route_id":"deep","bundle_digest":self.bundle_digest,
                 "expected":{"instance_id":self.instance_id,"incarnation_id":self.incarnation_id,
                     "execution_epoch":self.execution_epoch},
-                "operation_id":command.operation_id,"request_digest":command.request_digest,
+                "operation_id":scope.0,"request_digest":scope.1,
                 "payload":payload,"fd_table":table,
             });
             transact(self, name, body, fds)
@@ -164,6 +174,121 @@ impl Config {
         }
         result
     }
+}
+
+pub(super) fn validate_parked_restore(
+    config: Option<&Config>,
+    scope: Option<&RestoreScope>,
+    resources: &vmm::resources::VmResources,
+    checkpoint: &vmm::VmCheckpoint,
+) -> Result<bool, String> {
+    let (hold_token, writers) =
+        vmm::managed_block_restore::preflight_restore_writers(checkpoint, resources)?;
+    let Some(first) = writers.first() else {
+        return Ok(false);
+    };
+    let hold_token = hold_token.ok_or("parked writer capture has no Worker hold token")?;
+    let config = config.ok_or("writable parked restore requires a provisioned Worker endpoint")?;
+    let scope = scope
+        .ok_or("writable parked restore requires the exact source and target writer grants")?;
+    if resources
+        .guest_target
+        .as_ref()
+        .is_none_or(|target| target.epoch != config.execution_epoch)
+    {
+        return Err(
+            "Worker restore execution epoch does not match the parked identity target".into(),
+        );
+    }
+    let mut table = Vec::new();
+    let mut files = Vec::new();
+    let mut heads = Vec::new();
+    let origin = json!({"pivot_id":scope.source_pivot_id,"hold_token":hold_token,
+        "grant_id":first.source.grant_id,"execution_epoch":first.source.execution_epoch});
+    let source_grant = first.source.grant_id.clone();
+    let source_epoch = first.source.execution_epoch;
+    for writer in writers {
+        let a = writer.attachment;
+        let head = a
+            .writable_head_id
+            .as_ref()
+            .ok_or("parked writer is missing its head identity")?;
+        if a.execution_epoch != config.execution_epoch
+            || a.grant_id.as_ref() != Some(&scope.grant_id)
+            || writer.source.grant_id != source_grant
+            || writer.source.execution_epoch != source_epoch
+        {
+            return Err(
+                "parked writable attachments do not match the source and target grants".into(),
+            );
+        }
+        table.push(Entry {
+            index: table.len(),
+            resource_id: head.clone(),
+            role: "block_writer".into(),
+        });
+        heads.push(json!({"source_volume_id":writer.source.volume_id,"volume_id":a.volume_id,
+            "head_resource_id":head,"generation_id":a.generation_id,"layers":writer.layer_identities}));
+        files.push(writer.file);
+    }
+    let reply = config
+        .request(
+            "ValidateRestoreWriterSet",
+            (&scope.operation_id, &scope.request_digest),
+            json!({"origin":origin,"grant_id":scope.grant_id,
+                "expected_revision":scope.expected_revision,"heads":heads}),
+            &table,
+            &files,
+        )
+        .map_err(|error| error.render())?;
+    let grant = &reply.result["grant"];
+    if !reply.fds.is_empty()
+        || reply.result["origin"] != origin
+        || reply.result["heads"] != json!(heads)
+        || grant["grant_id"] != scope.grant_id
+        || grant["operation_id"] != scope.operation_id
+        || grant["incarnation_id"] != config.incarnation_id
+        || grant["execution_epoch"].as_u64() != Some(config.execution_epoch)
+        || grant["state"] != "attached"
+        || grant["revision"].as_i64() != Some(scope.expected_revision)
+    {
+        return Err("Worker parked restore receipt does not match the installed writer set".into());
+    }
+    Ok(true)
+}
+
+/// Bind a parked writable restore to the completed source pivot and target's
+/// actual Worker grant.
+///
+/// # Safety
+/// The configuration bytes must remain readable until this call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_configure_worker_block_restore_v1(
+    ctx_id: u32,
+    config: *const u8,
+    length: usize,
+) -> i32 {
+    if config.is_null() || length == 0 || length > 4096 {
+        return -libc::EINVAL;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(config, length) };
+    let Ok(value) = serde_json::from_slice::<RestoreScope>(bytes) else {
+        return -libc::EINVAL;
+    };
+    if !valid_id(&value.operation_id)
+        || !valid_digest(&value.request_digest)
+        || !valid_id(&value.source_pivot_id)
+        || !valid_id(&value.grant_id)
+        || value.expected_revision <= 0
+    {
+        return -libc::EINVAL;
+    }
+    let mut contexts = super::CTX_MAP.lock().unwrap();
+    let Some(context) = contexts.get_mut(&ctx_id) else {
+        return -libc::ENOENT;
+    };
+    context.worker_restore = Some(value);
+    0
 }
 
 /// Provision the authenticated Worker scope used by this VMM's held block actor.
@@ -782,7 +907,7 @@ impl Held {
         let reply = config
             .request(
                 method,
-                &self.command,
+                (&self.command.operation_id, &self.command.request_digest),
                 json!({
                     "expected_revision":revision, "hold_token":self.hold_token,
                 }),
@@ -799,7 +924,7 @@ impl Held {
 
     fn drive(&mut self, vmm: &Arc<Mutex<Vmm>>, config: &Config) -> Result<&Receipt, String> {
         if matches!(self.phase, Phase::Preparing) {
-            let response = config.request("PrepareWriterPivot", &self.command, json!({
+            let response = config.request("PrepareWriterPivot", (&self.command.operation_id, &self.command.request_digest), json!({
                 "previous_grant_id":self.previous_grant_id,"previous_grant_revision":self.command.previous_grant_revision,
                 "next_grant_id":self.command.next_grant_id,"hold_token":self.hold_token,"heads":self.heads,
             }), &[], &[]).map_err(|e| e.render())?;
@@ -848,6 +973,21 @@ impl Held {
             if revision.checked_add(1) != Some(receipt.revision) {
                 return Err("EIO unexpected WriterPivot finalization revision".into());
             }
+            let transitions: Vec<_> = receipt
+                .heads
+                .iter()
+                .map(|head| vmm::managed_block_restore::ParkedWriterTransition {
+                    volume_id: head.volume_id.clone(),
+                    previous_head: head.head_resource_id.clone(),
+                    next_head: head.next_resource_id.clone(),
+                })
+                .collect();
+            vmm.lock().unwrap().record_held_block_commit(
+                &self.capture,
+                &receipt.previous_grant_id,
+                &receipt.next_grant_id,
+                &transitions,
+            )?;
             self.phase = Phase::Finished(receipt);
         }
         match &self.phase {
@@ -867,7 +1007,13 @@ impl Held {
         ) {
             return Err("EBUSY writer pivot cannot roll back after the durable decision or a rollback failure".into());
         }
-        let reply = match config.request("QueryWriterPivot", &self.command, Value::Null, &[], &[]) {
+        let reply = match config.request(
+            "QueryWriterPivot",
+            (&self.command.operation_id, &self.command.request_digest),
+            Value::Null,
+            &[],
+            &[],
+        ) {
             Err(error) if error.code == "E_NOT_FOUND" && matches!(self.phase, Phase::Preparing) => {
                 return Ok(json!({"state":"aborted","operation_id":self.command.operation_id}));
             }

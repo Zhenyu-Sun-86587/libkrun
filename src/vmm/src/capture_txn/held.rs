@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+use crate::managed_block_restore::{
+    ParkedWriter, ParkedWriterTransition, parked_block_binding, verify_parked_block_binding,
+};
 use crate::{VmCheckpoint, Vmm, VmmRunState, resource_export::ResourceExport, snapshot};
 use serde_json::json;
 use std::fs::File;
@@ -50,6 +53,8 @@ pub(super) struct Capture {
     cancelled: bool,
     phase: Phase,
     point: Option<Arc<HeldExport>>,
+    writers: Vec<ParkedWriter>,
+    writers_committed: bool,
     error: Option<String>,
 }
 
@@ -111,9 +116,36 @@ impl HeldExport {
 }
 
 impl Vmm {
-    /// This first parked profile accepts an immutable block root and a small
-    /// set of local devices. Its Guest identity stage writes only to Guest RAM.
-    /// New device profiles must supply their own rebind and writer receipts.
+    pub fn record_held_block_commit(
+        &mut self,
+        arguments: &str,
+        previous: &str,
+        next: &str,
+        transitions: &[ParkedWriterTransition],
+    ) -> Result<(), String> {
+        let (token, fields) = Token::parse(arguments)?;
+        let capture = self
+            .capture_control
+            .capture
+            .as_ref()
+            .filter(|capture| capture.token == token && capture.phase == Phase::Held)
+            .ok_or("ESTALE block commit does not belong to a held capture")?;
+        if !fields.is_empty() {
+            return Err("EINVAL trailing block capture arguments".into());
+        }
+        if !capture.managed {
+            return Ok(());
+        }
+        self.verify_parked_storage_commit(&capture.writers, previous, next, transitions)?;
+        self.capture_control
+            .capture
+            .as_mut()
+            .unwrap()
+            .writers_committed = true;
+        Ok(())
+    }
+
+    /// Record the actual block graph and transport slots with the parked state.
     fn parked_bindings(&self) -> Result<Vec<String>, String> {
         use devices::virtio::{
             TYPE_BALLOON, TYPE_BLOCK, TYPE_CONSOLE, TYPE_RNG, guest_gate::DEVICE_TYPE,
@@ -125,17 +157,7 @@ impl Vmm {
                 let a = spec
                     .managed_attachment
                     .ok_or("unmanaged block in parked identity profile")?;
-                if !spec.read_only || a.writable_head_id.is_some() || a.layers.len() != 1 {
-                    return Err("parked target needs a fenced immutable disk closure".into());
-                }
-                json!([
-                    a.attachment_id,
-                    a.volume_id,
-                    a.generation_id,
-                    a.role,
-                    a.layers,
-                    spec.capacity_bytes
-                ])
+                parked_block_binding(&a, spec.read_only, spec.capacity_bytes)?
             } else if let Some((tap, profile)) = dev.tap {
                 if dev.device_id != tap.device_id {
                     return Err("registered TAP has a different stable id".into());
@@ -191,11 +213,29 @@ impl Vmm {
             _ => None,
         });
         let state = gates.next().ok_or("missing parked capture")?;
+        let target = self.parked_bindings()?;
         if gates.next().is_some()
-            || state.bindings != self.parked_bindings()?
+            || target.len() != state.bindings.len()
             || checkpoint.devices.devices.len() != state.bindings.len()
         {
-            return Err("parked target device or immutable storage closure mismatch".into());
+            return Err("parked target device or storage closure mismatch".into());
+        }
+        for (wanted, actual) in state.bindings.iter().zip(&target) {
+            let wanted: serde_json::Value =
+                serde_json::from_str(wanted).map_err(|_| "malformed source binding")?;
+            let actual: serde_json::Value =
+                serde_json::from_str(actual).map_err(|_| "malformed target binding")?;
+            let (Some(wanted), Some(actual)) = (wanted.as_array(), actual.as_array()) else {
+                return Err("malformed parked transport binding".into());
+            };
+            if wanted.len() != 6 || actual.len() != 6 || wanted[..5] != actual[..5] {
+                return Err("parked target device slot or descriptor mismatch".into());
+            }
+            if wanted[1].as_u64() == Some(devices::virtio::TYPE_BLOCK as u64) {
+                let _ = verify_parked_block_binding(&wanted[5], &actual[5])?;
+            } else if wanted[5] != actual[5] {
+                return Err("parked target device slot or descriptor mismatch".into());
+            }
         }
         let target_uplink = self.parked_uplink()?;
         self.guest_gate
@@ -270,6 +310,12 @@ impl Vmm {
                 acked_features: gate.acked_features(),
                 anchor,
                 helper,
+                writer_hold_token: self
+                    .capture_control
+                    .capture
+                    .as_ref()
+                    .filter(|capture| !capture.writers.is_empty())
+                    .map(|_| format!("{:032x}", token.nonce)),
                 bindings: self.parked_bindings()?,
             });
         }
@@ -398,6 +444,12 @@ impl Vmm {
                 cancelled: false,
                 phase: Phase::Unknown,
                 point: None,
+                writers: if managed {
+                    self.parked_storage_writers()?
+                } else {
+                    Vec::new()
+                },
+                writers_committed: false,
                 error: None,
             });
             if !from_standby && let Err(e) = self.pause() {
@@ -428,6 +480,16 @@ impl Vmm {
         } else if matches!(verb, "CAPTURE_FINISH" | "CAPTURE_CANCEL") {
             let record = self.capture_control.capture.as_ref().unwrap();
             let cancelled = verb == "CAPTURE_CANCEL";
+            if !record.writers.is_empty()
+                && !cancelled
+                && fields != ["KEEP_HELD"]
+                && !record.writers_committed
+            {
+                return Err("EBUSY parked capture requires a complete Worker writer pivot".into());
+            }
+            if cancelled && record.writers_committed {
+                return Err("EBUSY the captured block generations are already committed".into());
+            }
             if (fields == ["RETURN_STANDBY"] && !record.from_standby)
                 || (fields == ["CONTINUE"] && record.from_standby)
             {
@@ -513,6 +575,7 @@ impl Vmm {
             .filter(|c| c.token == token)
             .ok_or("ESTALE unknown capture session")?;
         if capture.cancelled
+            || (!capture.writers.is_empty() && !capture.writers_committed)
             || !matches!(
                 capture.phase,
                 Phase::Held | Phase::Finished | Phase::ReturnedStandby

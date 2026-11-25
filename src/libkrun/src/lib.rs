@@ -222,6 +222,13 @@ struct ContextConfig {
         feature = "blk",
         not(feature = "tee")
     ))]
+    worker_restore: Option<worker_pivot::RestoreScope>,
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
     target_authority: Option<std::os::unix::net::UnixDatagram>,
     vsock_config: VsockConfig,
     #[cfg(feature = "blk")]
@@ -6587,6 +6594,16 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                 layered_restore_ctx(&dir, generation).and_then(|restore| {
                     let state = vmm::VmCheckpoint::deserialize(&restore.checkpoint)
                         .map_err(|error| format!("decode checkpoint: {error}"))?;
+                    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+                    if parked_target {
+                        ctx_cfg.vmr.guest_target_writers_verified =
+                            worker_pivot::validate_parked_restore(
+                                ctx_cfg.worker_pivot.as_ref(),
+                                ctx_cfg.worker_restore.as_ref(),
+                                &ctx_cfg.vmr,
+                                &state,
+                            )?;
+                    }
                     if !parked_target
                         && state.devices.devices.iter().any(|device| {
                             matches!(device, devices::virtio::persist::DeviceSnapshot::Block(_))

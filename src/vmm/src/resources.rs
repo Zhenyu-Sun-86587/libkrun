@@ -186,6 +186,13 @@ pub struct VmResources {
     pub guest_identity_helper: Option<[u8; 32]>,
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     pub guest_target: Option<devices::virtio::guest_gate::TargetScope>,
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    pub guest_target_writers_verified: bool,
     /// The vCpu and memory configuration for this microVM.
     vm_config: VmConfig,
     /// The firmware to be loaded into the microVM.

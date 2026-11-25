@@ -1992,6 +1992,17 @@ pub fn build_microvm(
         not(feature = "tee")
     ))]
     if vm_resources.guest_target.is_some() {
+        if !vm_resources.guest_target_writers_verified
+            && vm_resources
+                .block
+                .list
+                .iter()
+                .any(|disk| !disk.lock().unwrap().is_read_only())
+        {
+            return Err(StartMicrovmError::GuestMemoryMmap(
+                "parked target requires actual Worker writer authorization".into(),
+            ));
+        }
         let checkpoint = restore_checkpoint.as_ref().ok_or_else(|| {
             StartMicrovmError::GuestMemoryMmap("identity target cannot cold boot".into())
         })?;

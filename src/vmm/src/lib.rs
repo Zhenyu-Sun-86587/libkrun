@@ -45,6 +45,13 @@ pub mod layered_restore;
 ))]
 pub mod managed_block_pivot;
 #[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "blk",
+    not(feature = "tee")
+))]
+pub mod managed_block_restore;
+#[cfg(all(
     any(target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64"),
     not(feature = "tee")
