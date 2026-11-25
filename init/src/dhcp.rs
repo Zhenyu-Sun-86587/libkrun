@@ -37,7 +37,6 @@ const DHCP_FLAG_BROADCAST: u16 = 0x8000;
 /// RFC 2132: marks options as DHCP format (99.130.83.99)
 const DHCP_MAGIC_COOKIE: u32 = 0x6382_5363;
 // linux/rtnetlink.h
-const RTNH_F_ONLINK: u32 = 4;
 
 // libc doesn't expose ifinfomsg, ifaddrmsg, or rtmsg — define them locally.
 
@@ -348,7 +347,7 @@ fn mod_route4(
     iface_index: i32,
     cmd: u16,
     gateway: u32,
-    on_link: bool,
+    gateway_host_route: bool,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; 4096];
     let base = mem::size_of::<libc::nlmsghdr>() + mem::size_of::<RtMsg>();
@@ -363,14 +362,18 @@ fn mod_route4(
 
     let rtm = RtMsg {
         rtm_family: libc::AF_INET as u8,
-        rtm_dst_len: 0,
+        rtm_dst_len: if gateway_host_route { 32 } else { 0 },
         rtm_src_len: 0,
         rtm_tos: 0,
         rtm_table: libc::RT_TABLE_MAIN,
         rtm_protocol: libc::RTPROT_BOOT,
-        rtm_scope: libc::RT_SCOPE_UNIVERSE,
+        rtm_scope: if gateway_host_route {
+            libc::RT_SCOPE_LINK
+        } else {
+            libc::RT_SCOPE_UNIVERSE
+        },
         rtm_type: libc::RTN_UNICAST,
-        rtm_flags: if on_link { RTNH_F_ONLINK } else { 0 },
+        rtm_flags: 0,
     };
     let rtm_off = mem::size_of::<libc::nlmsghdr>();
     buf[rtm_off..rtm_off + mem::size_of_val(&rtm)].copy_from_slice(struct_as_bytes(&rtm));
@@ -381,13 +384,21 @@ fn mod_route4(
         libc::RTA_OIF,
         &(iface_index as u32).to_ne_bytes(),
     );
-    add_rtattr(&mut buf, &mut msg_len, libc::RTA_DST, &0u32.to_ne_bytes());
+    let destination = if gateway_host_route { gateway } else { 0 };
     add_rtattr(
         &mut buf,
         &mut msg_len,
-        libc::RTA_GATEWAY,
-        &gateway.to_ne_bytes(),
+        libc::RTA_DST,
+        &destination.to_ne_bytes(),
     );
+    if !gateway_host_route {
+        add_rtattr(
+            &mut buf,
+            &mut msg_len,
+            libc::RTA_GATEWAY,
+            &gateway.to_ne_bytes(),
+        );
+    }
 
     nl_send(nl_sock, &buf[..msg_len])?;
     // Receive ACK
@@ -538,14 +549,24 @@ pub fn configure_static_ipv4(iface: &str, sock: i32, value: &str) -> anyhow::Res
         prefix,
     )
     .context("install static IPv4 address")?;
-    // Native assigns one /32 to each isolated guest port. The Worker gateway
-    // is reached on that link even though its address is outside the prefix.
+    let gateway = u32::from_ne_bytes(gateway.octets());
+    // Match the measured Guest identity helper's explicit link route for a /32 uplink.
+    if prefix == 32 {
+        mod_route4(
+            netlink.as_raw_fd(),
+            iface_index as i32,
+            libc::RTM_NEWROUTE,
+            gateway,
+            true,
+        )
+        .context("install static IPv4 gateway route")?;
+    }
     mod_route4(
         netlink.as_raw_fd(),
         iface_index as i32,
         libc::RTM_NEWROUTE,
-        u32::from_ne_bytes(gateway.octets()),
-        prefix == 32,
+        gateway,
+        false,
     )
     .context("install static IPv4 default route")?;
     if let Some(dns) = dns {
