@@ -14,7 +14,10 @@ pub struct ParkedState {
     pub acked_features: u64,
     pub anchor: [u8; 16],
     pub helper: [u8; 32],
-    /// Identifiers of the allowed hardware and immutable storage at the boundary.
+    /// Writer pivot challenge shared by the parked state and the Worker journal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_hold_token: Option<String>,
+    /// Identifiers of the hardware and storage at the boundary.
     pub bindings: Vec<String>,
 }
 

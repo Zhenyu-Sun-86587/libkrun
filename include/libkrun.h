@@ -312,6 +312,16 @@ int32_t krun_attach_block_set_v1(uint32_t ctx_id,
 int32_t krun_configure_worker_block_pivot_v1(uint32_t ctx_id,
                                               const uint8_t *config,
                                               size_t config_len);
+
+/* Supply the Worker grants for a parked writable restore. Call
+ * krun_configure_worker_block_pivot_v1 to configure the target execution
+ * and Worker endpoint. This UTF-8 JSON contains operation_id, request_digest,
+ * source_pivot_id, grant_id and expected_revision. Before target vCPUs start,
+ * the VMM proves the opened disk closure and writer OFDs to that Worker.
+ */
+int32_t krun_configure_worker_block_restore_v1(uint32_t ctx_id,
+                                              const uint8_t *config,
+                                              size_t config_len);
 #endif
 #endif
 
