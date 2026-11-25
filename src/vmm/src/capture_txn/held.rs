@@ -59,6 +59,10 @@ pub(super) struct Capture {
 }
 
 impl Capture {
+    pub(super) fn sequence(&self) -> u32 {
+        self.token.session
+    }
+
     pub(super) fn holds_vmm(&self) -> bool {
         matches!(
             self.phase,

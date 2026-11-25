@@ -132,6 +132,14 @@ impl GuestGate {
             .is_some_and(|s| s.phase == Phase::Released && s.number == number && s.nonce == nonce)
     }
 
+    pub fn source_status(&self) -> (u32, &'static str, bool) {
+        let (number, phase) = self
+            .session
+            .as_ref()
+            .map_or((0, "idle"), |s| (s.number, s.phase.wire()));
+        (number, phase, self.helper_digest.is_some())
+    }
+
     pub fn packets_parked(&self) -> bool {
         self.network_park
             && self

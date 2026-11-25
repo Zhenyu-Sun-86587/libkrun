@@ -157,13 +157,51 @@ impl Vmm {
     }
 
     pub fn deep_virtio_inventory(&self) -> Result<String, String> {
-        if self.guest_gate.is_none() {
-            return Err("native deep control was not provisioned".into());
-        }
+        let (gate_session, gate_phase, measured, quarantined) = {
+            let gate = self
+                .guest_gate
+                .as_ref()
+                .ok_or("native deep control was not provisioned")?
+                .lock()
+                .unwrap();
+            let (session, phase, measured) = gate.source_status();
+            (session, phase, measured, gate.target_quarantined())
+        };
+        let capture = self.capture_control.capture.as_ref();
+        let standby = self.capture_control.standby.as_ref();
+        let last_session = gate_session
+            .max(standby.map_or(0, |s| s.sequence))
+            .max(capture.map_or(0, held::Capture::sequence));
+        let disposition = if quarantined {
+            "QUARANTINED"
+        } else if capture.is_some_and(held::Capture::holds_vmm) {
+            "HELD"
+        } else {
+            match (self.run_state, standby.map(|s| s.disposition)) {
+                (VmmRunState::Paused, Some(Disposition::Standby)) => "STANDBY",
+                (_, Some(Disposition::FailedHeld)) => "FAILED_HELD",
+                (_, Some(Disposition::Waking)) => "WAKING",
+                (VmmRunState::Running, None | Some(Disposition::Running))
+                    if matches!(
+                        gate_phase,
+                        "idle" | "released" | "aborted" | "expired_thawed" | "failed_thawed"
+                    ) =>
+                {
+                    "RUNNING"
+                }
+                (VmmRunState::Running, _)
+                    if matches!(gate_phase, "armed" | "parking" | "parked") =>
+                {
+                    "GUEST_HELD"
+                }
+                _ => "UNKNOWN",
+            }
+        };
         let inventory = self.mmio_device_manager.capture_inventory()?;
         Ok(format!(
             "OK {}\n",
-            serde_json::json!({"protocol":"CaptureControl/1","devices":inventory})
+            serde_json::json!({"protocol":"CaptureControl/1","devices":inventory,"source_disposition":disposition,
+                "last_session":last_session, "guest_gate":gate_phase, "measured_helper":measured})
         ))
     }
 
