@@ -1,6 +1,7 @@
 """Boot a two-vCPU Guest and check the host-controlled source freezer on KVM."""
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,7 @@ import tempfile
 import time
 
 
-def guest(library, root, address, standby):
+def guest(library, root, address, standby, expected_helper):
     api = ctypes.CDLL(str(library))
     ctx = api.krun_create_ctx()
     if ctx < 0:
@@ -35,24 +36,34 @@ def guest(library, root, address, standby):
     empty = (ctypes.c_char_p * 1)(None)
     set_option("krun_set_exec", b"/counters", empty, empty)
     set_option("krun_enable_guest_gate_v1")
+    if expected_helper:
+        digest = bytes.fromhex(expected_helper)
+        set_option("krun_set_guest_identity_helper_v1", digest, ctypes.c_size_t(len(digest)))
     set_option("krun_set_control_socket", os.fsencode(address))
     set_option("krun_split_irqchip", False)
     set_option("krun_start_enter")
 
 
-def test(library, executable, standby):
+def test(library, executable, standby, helper, wrong_digest):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp, "root")
         root.mkdir()
         shutil.copy2(executable, root / "counters")
         address = Path(tmp, "control.sock")
+        measured = []
+        if helper:
+            (root / "sbin").mkdir()
+            (root / "etc").mkdir()
+            shutil.copy2(helper, root / "sbin/smolvm-identity-helper")
+            digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+            measured = ["--expected-helper", "ab" * 32 if wrong_digest else digest]
         if standby:
             for disk in ["data0", "archive"]:
                 with (Path(tmp) / disk).open("wb") as image:
                     image.write(b"smolvm-standby-test\0")
                     image.truncate(4 * 1024 * 1024)
         proc = subprocess.Popen(
-            [sys.executable, __file__, str(library), str(root), "--guest", str(address)] + (["--standby"] if standby else []),
+            [sys.executable, __file__, str(library), str(root), "--guest", str(address)] + (["--standby"] if standby else []) + measured,
             stdin=subprocess.DEVNULL,
         )
         def wire(line):
@@ -92,6 +103,14 @@ def test(library, executable, standby):
 
         try:
             wait_for(lambda: min(counts()) >= 2, 30)
+            if wrong_digest:
+                session = f"1 {secrets.token_hex(16)}"
+                assert command("PREPARE", session, "1000 2500").startswith("OK")
+                phase(session, "failed_thawed", -129)
+                start = counts()
+                wait_for(lambda: all(b > a for a, b in zip(start, counts())))
+                print("incorrect helper digest rejected before freeze; all counters running", flush=True)
+                return
             for number, decision, terminal in [(1, "RELEASE", "released"),
                                                 (2, "ABORT", "aborted"),
                                                 (3, None, "expired_thawed")]:
@@ -162,8 +181,13 @@ if __name__ == "__main__":
     parser.add_argument("guest_path", type=Path)
     parser.add_argument("--guest", type=Path, metavar="CONTROL_SOCKET", help=argparse.SUPPRESS)
     parser.add_argument("--standby", action="store_true", help="exercise raw standby with two test disks")
+    parser.add_argument("--identity-helper", type=Path, help="pin the actual static helper executable")
+    parser.add_argument("--wrong-digest", action="store_true", help="require pre-freeze measurement rejection")
+    parser.add_argument("--expected-helper", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.wrong_digest and not args.identity_helper:
+        parser.error("--wrong-digest requires --identity-helper")
     if args.guest:
-        guest(args.libkrun.resolve(), args.guest_path, args.guest, args.standby)
+        guest(args.libkrun.resolve(), args.guest_path, args.guest, args.standby, args.expected_helper)
     else:
-        test(args.libkrun.resolve(), args.guest_path.resolve(), args.standby)
+        test(args.libkrun.resolve(), args.guest_path.resolve(), args.standby, args.identity_helper, args.wrong_digest)

@@ -4979,6 +4979,41 @@ pub unsafe extern "C" fn krun_set_diskless_snapshot_ram_v1(
     }
 }
 
+/// Pin the digest of the trusted static identity helper for managed freezes.
+/// # Safety
+/// The caller must provide 32 readable bytes for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_set_guest_identity_helper_v1(
+    ctx_id: u32,
+    digest: *const u8,
+    length: usize,
+) -> i32 {
+    if digest.is_null() || length != 32 {
+        return -libc::EINVAL;
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    {
+        let value: [u8; 32] = unsafe { std::slice::from_raw_parts(digest, 32) }
+            .try_into()
+            .unwrap();
+        if value == [0; 32] {
+            return -libc::EINVAL;
+        }
+        let mut contexts = CTX_MAP.lock().unwrap();
+        let Some(context) = contexts.get_mut(&ctx_id) else {
+            return -libc::ENOENT;
+        };
+        context.vmr.guest_gate = true;
+        context.vmr.guest_identity_helper = Some(value);
+        KRUN_SUCCESS
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))))]
+    {
+        let _ = ctx_id;
+        -libc::ENOTSUP
+    }
+}
+
 /// Attach the host-bound userspace freezer control device before boot.
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_enable_guest_gate_v1(ctx_id: u32) -> i32 {
