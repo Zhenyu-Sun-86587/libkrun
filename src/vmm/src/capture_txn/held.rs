@@ -431,7 +431,14 @@ impl Vmm {
                 }
                 self.parked_bindings().map_err(|e| format!("ENOTSUP {e}"))?;
             }
-            self.raw_profile().map_err(|e| format!("ENOTSUP {e}"))?;
+            if self.prototype_memory.is_some() || self.prototype_cpu_topology.is_some() {
+                return Err(
+                    "ENOTSUP capture of live resize topology requires a compatible state reader"
+                        .into(),
+                );
+            }
+            self.standby_profile(&self.mmio_device_manager.capture_inventory()?)
+                .map_err(|e| format!("ENOTSUP {e}"))?;
             if !self.has_layered_ram() {
                 let regions = snapshot::memfd_region_descs(&self.guest_memory);
                 if regions.is_empty() || regions.iter().any(|r| r.fd < 0) {

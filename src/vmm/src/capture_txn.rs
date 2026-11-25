@@ -52,6 +52,7 @@ impl DeviceInfo {
             || concrete.is::<Console>()
             || concrete.is::<Rng>()
             || concrete.is::<Vsock>()
+            || concrete.is::<devices::virtio::memory::MemoryDevice>()
             || concrete.is::<GuestGate>();
         #[cfg(not(feature = "aws-nitro"))]
         {
@@ -142,13 +143,19 @@ impl Vmm {
                 .is_some_and(|s| s.disposition != Disposition::Running)
     }
 
-    fn raw_profile(&self) -> Result<(), String> {
+    fn standby_profile(&self, inventory: &[DeviceInfo]) -> Result<(), String> {
         self.ensure_restore_complete().map_err(|e| e.to_string())?;
         self.ensure_ram_mapping_valid().map_err(|e| e.to_string())?;
-        if self.prototype_memory.is_some() || self.prototype_cpu_topology.is_some() {
-            return Err("live resize topology needs reconciliation before standby".into());
+        if self.prototype_cpu_topology.is_some() {
+            self.prototype_cpu_status()?;
         }
-        for device in self.mmio_device_manager.capture_inventory()? {
+        if self.prototype_memory.is_some() {
+            let (mapped, plugged) = self.prototype_memory_status()?;
+            if mapped != plugged {
+                return Err("Guest memory growth is still pending".into());
+            }
+        }
+        for device in inventory {
             if !device.quiesce_supported {
                 return Err(format!("unsupported standby device {}", device.device_id));
             }
@@ -198,10 +205,11 @@ impl Vmm {
             }
         };
         let inventory = self.mmio_device_manager.capture_inventory()?;
+        let standby_blocker = self.standby_profile(&inventory).err();
         Ok(format!(
             "OK {}\n",
             serde_json::json!({"protocol":"CaptureControl/1","devices":inventory,"source_disposition":disposition,
-                "last_session":last_session, "guest_gate":gate_phase, "measured_helper":measured})
+                "last_session":last_session, "guest_gate":gate_phase, "measured_helper":measured,"standby_blocker":standby_blocker})
         ))
     }
 
@@ -279,7 +287,8 @@ impl Vmm {
                         "EBUSY Guest freezer does not match the requested standby mode".into(),
                     );
                 }
-                self.raw_profile().map_err(|e| format!("ENOTSUP {e}"))?;
+                self.standby_profile(&self.mmio_device_manager.capture_inventory()?)
+                    .map_err(|e| format!("ENOTSUP {e}"))?;
                 self.capture_control.standby = Some(StandbyReceipt {
                     managed,
                     sequence,
