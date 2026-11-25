@@ -179,6 +179,9 @@ pub struct VmResources {
     pub live_cpu_growth: bool,
     /// Attach virtio-mem for adding RAM after boot (Linux x86_64).
     pub live_memory_growth: bool,
+    /// Attach the host-controlled freezer mailbox to this managed profile.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    pub guest_gate: bool,
     /// The vCpu and memory configuration for this microVM.
     vm_config: VmConfig,
     /// The firmware to be loaded into the microVM.

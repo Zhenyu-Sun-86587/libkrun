@@ -2032,6 +2032,13 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) 
             let _arg = parts.next().map(str::trim).unwrap_or("");
             let lazy_ram = lazy_ram_unready(&verb);
             match verb.as_str() {
+                #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+                "GUEST_GATE_PREPARE" | "GUEST_GATE_QUERY" | "GUEST_GATE_RELEASE"
+                | "GUEST_GATE_ABORT" => vmm
+                    .lock()
+                    .unwrap()
+                    .guest_gate_control(&verb, _arg)
+                    .unwrap_or_else(|e| format!("ERR {e}\n")),
                 _ if lazy_ram.is_some() => format!("ERR EIO {}\n", lazy_ram.unwrap()),
                 #[cfg(all(
                     any(target_os = "linux", target_os = "macos"),
@@ -4717,6 +4724,25 @@ pub extern "C" fn krun_set_snapshot_memory_fd2(ctx_id: u32, fd: i32, flags: u32)
         return -libc::EINVAL;
     }
     set_snapshot_memory_input(ctx_id, fd, flags == 1)
+}
+
+/// Attach the host-bound userspace freezer control device before boot.
+#[unsafe(no_mangle)]
+pub extern "C" fn krun_enable_guest_gate_v1(ctx_id: u32) -> i32 {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    {
+        let mut contexts = CTX_MAP.lock().unwrap();
+        let Some(context) = contexts.get_mut(&ctx_id) else {
+            return -libc::ENOENT;
+        };
+        context.vmr.guest_gate = true;
+        KRUN_SUCCESS
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))))]
+    {
+        let _ = ctx_id;
+        -libc::ENOTSUP
+    }
 }
 
 fn set_snapshot_memory_input(ctx_id: u32, fd: i32, immutable: bool) -> i32 {

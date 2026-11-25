@@ -458,6 +458,8 @@ impl VmCheckpoint {
 
 /// Contains the state and associated methods required for the Firecracker VMM.
 pub struct Vmm {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    guest_gate: Option<Arc<Mutex<devices::virtio::guest_gate::GuestGate>>>,
     // Guest VM core resources.
     // Must drop before `guest_memory`: the handler can reference its mappings.
     #[cfg(target_os = "linux")]
@@ -650,6 +652,7 @@ fn paused_vm_with_failed_ram_mapping_cannot_capture_or_rearm() {
     .unwrap();
     let mut mmio_base = arch::MMIO_MEM_START;
     let mut vmm = Vmm {
+        guest_gate: None,
         prototype_memory: None,
         memory_growth_topology: None,
         prototype_cpu_topology: None,
@@ -2695,6 +2698,21 @@ impl Vmm {
             }
             VmmRunState::Resuming => Err(Error::VcpuResume),
         }
+    }
+
+    /// Dispatch a control request to the mailbox attached to this VMM.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    pub fn guest_gate_control(
+        &self,
+        verb: &str,
+        args: &str,
+    ) -> std::result::Result<String, &'static str> {
+        self.guest_gate
+            .as_ref()
+            .ok_or("ENOTSUP guest gate is not attached")?
+            .lock()
+            .unwrap()
+            .control(verb, args)
     }
 
     /// Return the current runtime state.
