@@ -267,6 +267,42 @@ int32_t krun_add_disk4(uint32_t ctx_id,
                        uint32_t sync_mode,
                        uint32_t io_engine);
 
+#if defined(__linux__)
+struct krun_managed_block_layer_v1 {
+    const char *resource_id;
+    int32_t fd;
+    uint32_t format; /* KRUN_DISK_FORMAT_RAW or KRUN_DISK_FORMAT_QCOW2 */
+};
+
+struct krun_managed_block_v1 {
+    uint32_t size;
+    uint32_t version;
+    const char *attachment_id;
+    const char *device_id;
+    const char *role;
+    const char *volume_id;
+    const char *generation_id;
+    const char *writable_head_id;
+    const char *grant_id;
+    uint64_t execution_epoch;
+    uint64_t capacity_bytes;
+    const struct krun_managed_block_layer_v1 *layers;
+    size_t layer_count;
+};
+
+/* Install one complete managed block set for cold boot. Set size to sizeof
+ * the v1 struct and version to 1. Pass each layer from the head to the oldest
+ * ancestor. An immutable attachment has NULL head and grant identifiers.
+ * Writable layers require the Worker writer-grant O_RDWR descriptor. All
+ * remaining layers require O_RDONLY. Both descriptors retain their original
+ * open file descriptions. The caller retains ownership of its FD numbers.
+ * QCOW2 layer headers must name the exact backing resource ID and format.
+ */
+int32_t krun_attach_block_set_v1(uint32_t ctx_id,
+                                  const struct krun_managed_block_v1 *specs,
+                                  size_t count);
+#endif
+
 /**
  * Creates a copy-on-write qcow2 overlay backed by an existing disk image.
  *

@@ -205,7 +205,7 @@ impl DiskBackend {
     }
 }
 
-fn disk_backend<D>(
+pub(super) fn disk_backend<D>(
     driver: D,
     io_engine: BlockIoEngine,
     prepared_async: Option<AsyncIo>,
@@ -306,7 +306,7 @@ impl DiskProperties {
         Ok(device_id)
     }
 
-    fn build_disk_image_id(disk_file: &File) -> Vec<u8> {
+    pub(super) fn build_disk_image_id(disk_file: &File) -> Vec<u8> {
         let mut default_id = vec![0; VIRTIO_BLK_ID_BYTES as usize];
         match Self::build_device_id(disk_file) {
             Err(_) => {
@@ -421,6 +421,8 @@ pub struct Block {
     // Implementation specific fields.
     pub(crate) id: String,
     pub(crate) partuuid: Option<String>,
+    #[cfg(target_os = "linux")]
+    pub(crate) managed_attachment: Option<super::managed::ManagedAttachment>,
 }
 
 /// A replacement backing image opened and validated before a live block pivot.
@@ -655,6 +657,35 @@ impl Block {
             disk_properties
         };
 
+        Self::from_opened_disk(
+            id,
+            partuuid,
+            cache_type,
+            disk_image,
+            disk_image_id,
+            disk_properties,
+            discard_alignment,
+            is_disk_read_only,
+            direct_io,
+            sync_mode,
+            io_engine,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_opened_disk(
+        id: String,
+        partuuid: Option<String>,
+        cache_type: CacheType,
+        disk_image: Arc<DiskBackend>,
+        disk_image_id: Vec<u8>,
+        disk_properties: DiskProperties,
+        discard_alignment: usize,
+        is_disk_read_only: bool,
+        direct_io: bool,
+        sync_mode: SyncMode,
+        io_engine: BlockIoEngine,
+    ) -> io::Result<Self> {
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)
             | (1u64 << VIRTIO_BLK_F_DISCARD)
@@ -720,6 +751,8 @@ impl Block {
             worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
             quiesced_worker: None,
             snapshot_error: None,
+            #[cfg(target_os = "linux")]
+            managed_attachment: None,
         })
     }
 
@@ -733,6 +766,13 @@ impl Block {
     /// and must never use it on an immutable ancestor of another machine.
     /// Filesystem growth inside the guest is a separate, subsequent operation.
     pub fn grow(&mut self, bytes: u64) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.managed_attachment.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "managed disk growth requires a Worker operation",
+            ));
+        }
         let current = self.config.capacity * SECTOR_SIZE;
         if bytes < current || !bytes.is_multiple_of(SECTOR_SIZE) {
             return Err(io::Error::new(
@@ -784,6 +824,13 @@ impl Block {
         path: &str,
         format: ImageType,
     ) -> io::Result<PreparedDiskPivot> {
+        #[cfg(target_os = "linux")]
+        if self.managed_attachment.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "managed disk pivot requires authorized handles",
+            ));
+        }
         if self.is_read_only() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
