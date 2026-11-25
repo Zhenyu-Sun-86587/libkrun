@@ -6574,9 +6574,23 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                 set_last_error("host networking cannot be combined with a port publishing map");
                 return -libc::EINVAL;
             }
+            #[allow(unused_mut)]
+            let mut guest_cid = 3;
+            #[cfg(target_os = "linux")]
+            if ctx_cfg.vmr.guest_gate && tsi_flags.is_empty() && ctx_cfg.unix_ipc_port_map.is_some()
+            {
+                let mut random = [0u8; 4];
+                if unsafe { libc::getrandom(random.as_mut_ptr().cast(), random.len(), 0) }
+                    != random.len() as isize
+                {
+                    set_last_error("cannot allocate a distinct managed Guest vsock CID");
+                    return -libc::EIO;
+                }
+                guest_cid = u32::from_ne_bytes(random) % (u32::MAX - 3) + 3;
+            }
             let vsock_device_config = VsockDeviceConfig {
                 vsock_id: "vsock0".to_string(),
-                guest_cid: 3,
+                guest_cid,
                 host_port_map: ctx_cfg.tsi_port_map,
                 unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
                 tsi_flags: *tsi_flags,

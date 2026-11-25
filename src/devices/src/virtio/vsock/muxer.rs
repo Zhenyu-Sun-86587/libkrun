@@ -275,6 +275,53 @@ impl FailedCreates {
 }
 
 impl VsockMuxer {
+    /// A parked management transport is exclusively Unix IPC. TSI sockets
+    /// and external forwarding have different lifetime and rebind contracts.
+    pub(crate) fn parked_ports(&self) -> Option<Vec<(u32, bool, String)>> {
+        use sha2::{Digest, Sha256};
+        if !self.tsi_flags.is_empty()
+            || self.host_port_map.is_some()
+            || self.stream_intercept.is_some()
+        {
+            return None;
+        }
+        let map = self.unix_ipc_port_map.as_ref()?;
+        if map.is_empty() || map.values().filter(|(_, listen)| *listen).count() > 1 {
+            return None;
+        }
+        let mut ports = Vec::with_capacity(map.len());
+        let mut paths = HashSet::new();
+        for (&port, (path, listen)) in map {
+            if port == 0 || !path.is_absolute() || !paths.insert(path) {
+                return None;
+            }
+            let digest = format!("{:x}", Sha256::digest(path.to_str()?.as_bytes()));
+            ports.push((port, *listen, digest));
+        }
+        ports.sort_unstable_by_key(|(port, _, _)| *port);
+        Some(ports)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn fence_parked_peers(&self) -> Result<(), String> {
+        // The host event gate is drained. Shutdown disconnects the peer even
+        // if a reaper briefly retains a reference to its proxy.
+        for proxy in self.proxy_map.read().unwrap().values() {
+            let proxy = proxy.lock().unwrap();
+            if proxy.is_listener() {
+                continue;
+            }
+            if unsafe { libc::shutdown(proxy.poll_handle(), libc::SHUT_RDWR) } < 0 {
+                let error = std::io::Error::last_os_error();
+                if !matches!(error.raw_os_error(), Some(libc::ENOTCONN | libc::EINVAL)) {
+                    return Err(format!("close a parked vsock peer: {error}"));
+                }
+            }
+        }
+        self.reset_connections();
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         cid: u64,
@@ -389,7 +436,8 @@ impl VsockMuxer {
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
-    ) {
+        require_listener: bool,
+    ) -> Result<(), String> {
         let activate_start = std::time::Instant::now();
         debug!("[VSOCK_TIMING] muxer.activate() called, cid={}", self.cid);
 
@@ -473,7 +521,7 @@ impl VsockMuxer {
                 .and_then(|result| result.as_ref().ok())
                 .cloned(),
         );
-        thread.run();
+        thread.run(require_listener)?;
         debug!("[VSOCK_TIMING] MuxerThread spawned");
 
         self.reaper_sender = Some(sender);
@@ -485,6 +533,7 @@ impl VsockMuxer {
             "[VSOCK_TIMING] muxer.activate() completed in {:?}",
             activate_start.elapsed()
         );
+        Ok(())
     }
 
     pub(crate) fn quiesce_for_snapshot(&self) {

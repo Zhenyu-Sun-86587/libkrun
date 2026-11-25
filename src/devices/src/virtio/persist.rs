@@ -335,6 +335,7 @@ mod tests {
                     queue_ev: Some(qs),
                     host_network_abi: None,
                     listeners: Vec::new(),
+                    parked_rebind: true,
                 }),
             ],
             interrupt_status: vec![0, 1],

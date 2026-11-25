@@ -77,11 +77,15 @@ impl MuxerThread {
         }
     }
 
-    pub fn run(self) {
+    pub fn run(self, require_listener: bool) -> Result<(), String> {
+        if require_listener {
+            self.create_listening_ipc_sockets(true)?;
+        }
         thread::Builder::new()
             .name("vsock muxer".into())
-            .spawn(|| self.work())
-            .unwrap();
+            .spawn(move || self.work(!require_listener))
+            .map_err(|error| format!("start vsock muxer: {error}"))?;
+        Ok(())
     }
 
     fn send_credit_request(&self, credit_rx: MuxerRx) {
@@ -192,7 +196,7 @@ impl MuxerThread {
 
     /// Set up AF_UNIX host-IPC listeners from `unix_ipc_port_map`. Cross-platform
     /// (AF_UNIX is available on Unix and Windows via socket2).
-    fn create_lisening_ipc_sockets(&self) {
+    fn create_listening_ipc_sockets(&self, required: bool) -> Result<(), String> {
         let start = std::time::Instant::now();
         debug!(
             "[VSOCK_TIMING] create_lisening_ipc_sockets() called, {} ports to create",
@@ -221,17 +225,32 @@ impl MuxerThread {
                     proxy
                 }
                 Err(e) => {
+                    if required {
+                        return Err(format!(
+                            "create managed vsock listener for port {port}: {e}"
+                        ));
+                    }
                     warn!("Failed to create listening proxy at {path:?}: {e:?}");
                     continue;
                 }
             };
+            if required {
+                self.epoll
+                    .ctl(
+                        ControlOperation::Add,
+                        proxy.poll_handle(),
+                        &EpollEvent::new(EventSet::IN, id),
+                    )
+                    .map_err(|error| {
+                        format!("observe managed vsock listener for port {port}: {error}")
+                    })?;
+            } else {
+                self.update_polling(id, proxy.poll_handle(), EventSet::IN);
+            }
             self.proxy_map
                 .write()
                 .unwrap()
                 .insert(id, Arc::new(Mutex::new(Box::new(proxy))));
-            if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
-                self.update_polling(id, proxy.lock().unwrap().poll_handle(), EventSet::IN);
-            };
             debug!("[VSOCK_TIMING] port {} registered with epoll", port);
         }
 
@@ -239,6 +258,7 @@ impl MuxerThread {
             "[VSOCK_TIMING] create_lisening_ipc_sockets() completed in {:?}",
             start.elapsed()
         );
+        Ok(())
     }
 
     pub(super) fn process_host_event(&self, id: u64, evset: EventSet, thread_rng: &mut ThreadRng) {
@@ -294,14 +314,14 @@ impl MuxerThread {
         }
     }
 
-    fn work(mut self) {
+    fn work(mut self, configure_listeners: bool) {
         let work_start = std::time::Instant::now();
         debug!("[VSOCK_TIMING] MuxerThread work() started");
 
         let mut thread_rng = rng();
-        {
+        if configure_listeners {
             let _activity = self.host_event_gate.enter();
-            self.create_lisening_ipc_sockets();
+            let _ = self.create_listening_ipc_sockets(false);
         }
 
         debug!(

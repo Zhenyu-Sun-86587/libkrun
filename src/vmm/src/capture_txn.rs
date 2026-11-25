@@ -28,6 +28,10 @@ pub(crate) struct DeviceInfo {
     offered_features: u64,
     negotiated_features: u64,
     pub quiesce_supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parked_vsock_rebind: Option<bool>,
+    #[serde(skip)]
+    vsock_binding: Option<(u64, Vec<(u32, bool, String)>)>,
     pub block: Option<BlockInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tap: Option<(devices::virtio::guest_gate::ParkedUplink, serde_json::Value)>,
@@ -44,6 +48,8 @@ impl DeviceInfo {
     ) -> Result<Self, String> {
         let concrete = dev.as_any();
         let block = concrete.downcast_ref::<Block>();
+        let vsock = concrete.downcast_ref::<Vsock>();
+        let vsock_binding = vsock.and_then(Vsock::parked_binding);
         if block.is_some_and(|b| b.id() != id) {
             return Err(format!(
                 "block ID does not match the registered transport: {id}"
@@ -75,6 +81,8 @@ impl DeviceInfo {
             offered_features: dev.avail_features(),
             negotiated_features: dev.acked_features(),
             quiesce_supported,
+            parked_vsock_rebind: vsock.map(|_| vsock_binding.is_some()),
+            vsock_binding,
             #[cfg(not(feature = "aws-nitro"))]
             bootstrap_init_sha256: concrete
                 .downcast_ref::<devices::virtio::Fs>()
