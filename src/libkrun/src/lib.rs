@@ -239,6 +239,8 @@ struct ContextConfig {
     snapshot_memory: Option<std::fs::File>,
     #[cfg(target_os = "linux")]
     snapshot_memory_immutable: bool,
+    #[cfg(all(target_os = "linux", fork_supported, feature = "blk"))]
+    diskless_snapshot_ram: Option<vmm::layered_restore::Generation>,
 }
 
 impl ContextConfig {
@@ -1704,6 +1706,28 @@ fn build_restore_ctx_with_memory(
     build_restore_ctx_with_memory_mode(dir, readonly_memory, layered_requested)
 }
 
+#[cfg(all(target_os = "linux", fork_supported))]
+fn layered_restore_ctx(
+    directory: &std::path::Path,
+    generation: vmm::layered_restore::Generation,
+) -> std::result::Result<vmm::builder::RestoreCtx, String> {
+    let guest_memory = generation
+        .restore()
+        .map_err(|error| format!("map layered RAM: {error}"))?;
+    let count = generation.memory_regions().len();
+    let checkpoint = std::fs::read(directory.join("checkpoint.bin"))
+        .map_err(|error| format!("checkpoint: {error}"))?;
+    Ok(vmm::builder::RestoreCtx {
+        demand_pager: None,
+        layered_ram: Some(generation),
+        guest_memory,
+        fork_backed_regions: vec![true; count],
+        checkpoint,
+        portable_clock: false,
+        cow_backing: Vec::new(),
+    })
+}
+
 /// Restore guest RAM from the stored checkpoint smolvm named instead of a RAM
 /// image. Only a branchable machine restores this way: its RAM is a layered
 /// generation over the memfd being filled, so guest writes stay private and
@@ -1772,22 +1796,7 @@ fn build_restore_ctx_with_memory_mode(
     if magic_bytes == vmm::layered_restore::MANIFEST_MAGIC {
         let generation = vmm::layered_restore::Generation::decode_manifest(&manifest)
             .map_err(|error| format!("layered RAM manifest: {error}"))?;
-        let guest_memory = generation
-            .restore()
-            .map_err(|error| format!("map layered RAM: {error}"))?;
-        let count = generation.memory_regions().len();
-        let checkpoint = std::fs::read(dir.join("checkpoint.bin"))
-            .map_err(|error| format!("checkpoint: {error}"))?;
-        return Ok(vmm::builder::RestoreCtx {
-            demand_pager: None,
-            layered_ram: Some(generation),
-            guest_memory,
-            fork_backed_regions: vec![true; count],
-            checkpoint,
-            portable_clock: false,
-            #[cfg(target_os = "linux")]
-            cow_backing: Vec::new(),
-        });
+        return layered_restore_ctx(dir, generation);
     }
     if magic == PORTABLE_MANIFEST_MAGIC {
         let descs = decode_portable_manifest(&manifest).map_err(|e| format!("manifest: {e}"))?;
@@ -4719,6 +4728,103 @@ pub extern "C" fn krun_set_snapshot_memory_fd2(ctx_id: u32, fd: i32, flags: u32)
     set_snapshot_memory_input(ctx_id, fd, flags == 1)
 }
 
+#[cfg(all(target_os = "linux", fork_supported, feature = "blk"))]
+#[unsafe(no_mangle)]
+/// # Safety
+/// The directory must be a valid NUL-terminated string. The callback receives
+/// borrowed bytes and descriptors valid only for its invocation.
+pub unsafe extern "C" fn krun_export_snapshot_ram_v1(
+    directory: *const c_char,
+    callback: Option<
+        unsafe extern "C" fn(*const u8, size_t, *const i32, size_t, *mut c_void) -> i32,
+    >,
+    opaque: *mut c_void,
+) -> i32 {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(callback) = callback else {
+        return -libc::EINVAL;
+    };
+    if directory.is_null() {
+        return -libc::EINVAL;
+    }
+    let directory = unsafe { CStr::from_ptr(directory) };
+    let directory = std::path::Path::new(std::ffi::OsStr::from_bytes(directory.to_bytes()));
+    let result = (|| {
+        use vmm::layered_restore::{Generation, MANIFEST_MAGIC};
+        use vmm::resource_export::ResourceExport;
+        let manifest = std::fs::read(directory.join("manifest.bin"))?;
+        // The exporter may only use a socket-based capture published in this
+        // process. Deep RAM transfer never reopens a foreign process's FDs.
+        if manifest.get(..8) != Some(&MANIFEST_MAGIC)
+            || manifest.get(8..12) != Some(&std::process::id().to_le_bytes())
+            || manifest.get(12..16) != Some(&1_u32.to_le_bytes())
+        {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP));
+        }
+        let resources = Generation::decode_manifest(&manifest)?.export_resource()?;
+        let descriptor = resources.descriptor_json()?;
+        if descriptor.len() > ResourceExport::MAX_DESCRIPTOR_BYTES
+            || resources.backings.len() > ResourceExport::MAX_BACKINGS
+        {
+            return Err(std::io::Error::from_raw_os_error(libc::E2BIG));
+        }
+        let fds: Vec<_> = resources
+            .backings
+            .values()
+            .map(|file| file.as_raw_fd())
+            .collect();
+        // The export retains all borrowed descriptors until the callback returns.
+        Ok(unsafe {
+            callback(
+                descriptor.as_ptr(),
+                descriptor.len(),
+                fds.as_ptr(),
+                fds.len(),
+                opaque,
+            )
+        })
+    })();
+    result.unwrap_or_else(|error: std::io::Error| -error.raw_os_error().unwrap_or(libc::EINVAL))
+}
+
+#[cfg(all(target_os = "linux", fork_supported, feature = "blk"))]
+#[unsafe(no_mangle)]
+/// # Safety
+/// The descriptor and FD pointers must refer to initialized arrays of the
+/// supplied lengths. The input descriptors must remain open until return.
+pub unsafe extern "C" fn krun_set_diskless_snapshot_ram_v1(
+    ctx_id: u32,
+    descriptor: *const u8,
+    descriptor_len: size_t,
+    fds: *const i32,
+    fd_count: size_t,
+) -> i32 {
+    use vmm::resource_export::ResourceExport;
+    if descriptor.is_null()
+        || descriptor_len == 0
+        || descriptor_len > ResourceExport::MAX_DESCRIPTOR_BYTES
+        || fds.is_null()
+        || fd_count == 0
+        || fd_count > ResourceExport::MAX_BACKINGS
+    {
+        return -libc::EINVAL;
+    }
+    let descriptor = unsafe { std::slice::from_raw_parts(descriptor, descriptor_len) };
+    let fds = unsafe { std::slice::from_raw_parts(fds, fd_count) };
+    let result = ResourceExport::from_ordered_fds(descriptor, fds).and_then(ResourceExport::import);
+    let generation = match result {
+        Ok(generation) => generation,
+        Err(error) => return -error.raw_os_error().unwrap_or(libc::EINVAL),
+    };
+    match CTX_MAP.lock().unwrap().get_mut(&ctx_id) {
+        Some(config) => {
+            config.diskless_snapshot_ram = Some(generation);
+            KRUN_SUCCESS
+        }
+        None => -libc::ENOENT,
+    }
+}
+
 fn set_snapshot_memory_input(ctx_id: u32, fd: i32, immutable: bool) -> i32 {
     #[cfg(all(target_os = "linux", fork_supported))]
     {
@@ -5930,6 +6036,17 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         None => return -libc::ENOENT,
     };
 
+    #[cfg(all(target_os = "linux", fork_supported, feature = "blk"))]
+    if ctx_cfg.diskless_snapshot_ram.is_some()
+        && (ctx_cfg.snapshot_dir.is_none()
+            || ctx_cfg.snapshot_memory.is_some()
+            || !ctx_cfg.block_cfgs.is_empty()
+            || ctx_cfg.block_root.is_some())
+    {
+        set_last_error("detached RAM requires a snapshot directory and a diskless VM");
+        return -libc::EINVAL;
+    }
+
     if ctx_cfg.vmr.external_kernel.is_none()
         && ctx_cfg.vmr.kernel_bundle.is_none()
         && ctx_cfg.vmr.firmware_config.is_none()
@@ -6054,7 +6171,26 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     #[cfg(fork_supported)]
     let restore_ctx = match ctx_cfg.snapshot_dir.take() {
         Some(dir) => {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "blk"))]
+            let result = if let Some(generation) = ctx_cfg.diskless_snapshot_ram.take() {
+                layered_restore_ctx(&dir, generation).and_then(|restore| {
+                    let state = vmm::VmCheckpoint::deserialize(&restore.checkpoint)
+                        .map_err(|error| format!("decode checkpoint: {error}"))?;
+                    if state.devices.devices.iter().any(|device| {
+                        matches!(device, devices::virtio::persist::DeviceSnapshot::Block(_))
+                    }) {
+                        return Err("detached RAM restore requires a diskless checkpoint".into());
+                    }
+                        Ok(restore)
+                })
+            } else {
+                build_restore_ctx_with_memory(
+                    &dir,
+                    ctx_cfg.snapshot_memory.take().as_ref(),
+                    ctx_cfg.snapshot_memory_immutable,
+                )
+            };
+            #[cfg(all(target_os = "linux", not(feature = "blk")))]
             let result = build_restore_ctx_with_memory(
                 &dir,
                 ctx_cfg.snapshot_memory.take().as_ref(),
