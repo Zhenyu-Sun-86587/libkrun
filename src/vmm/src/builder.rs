@@ -230,6 +230,9 @@ pub enum StartMicrovmError {
     RegisterInputDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Network Device or add a device to the MMIO Bus.
     RegisterNetDevice(device_manager::mmio::Error),
+    /// Cannot register the Guest freezer mailbox.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    RegisterGuestGate(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Rng device or add a device to the MMIO Bus.
     RegisterRngDevice(device_manager::mmio::Error),
     /// Cannot initialize a vhost-user device or add a device to the MMIO Bus.
@@ -471,6 +474,8 @@ impl Display for StartMicrovmError {
                     "Cannot initialize a MMIO Network Device or add a device to the MMIO Bus. {err_msg}"
                 )
             }
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+            RegisterGuestGate(ref err) => write!(f, "Cannot register Guest freezer mailbox: {err}"),
             RegisterRngDevice(ref err) => {
                 let mut err_msg = format!("{err}");
                 err_msg = err_msg.replace('\"', "");
@@ -1640,6 +1645,9 @@ pub fn build_microvm(
             not(feature = "tee")
         ))]
         prototype_memory: None,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        guest_gate: None,
+
         #[cfg(all(
             any(target_os = "linux", target_os = "macos"),
             any(target_arch = "x86_64", target_arch = "aarch64"),
@@ -1755,6 +1763,13 @@ pub fn build_microvm(
         {
             attach_rng_device(&mut vmm, event_manager, intc.clone())?;
         }
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    if vm_resources.guest_gate {
+        let gate = Arc::new(Mutex::new(devices::virtio::guest_gate::GuestGate::default()));
+        attach_mmio_device(&mut vmm, "guest-gate".into(), intc.clone(), gate.clone())
+            .map_err(StartMicrovmError::RegisterGuestGate)?;
+        vmm.guest_gate = Some(gate);
     }
     for (console_id, console_cfg) in vm_resources.virtio_consoles.iter().enumerate() {
         attach_console_devices(

@@ -1174,6 +1174,9 @@ int32_t krun_set_console_output(uint32_t ctx_id, const char *c_filepath);
  */
 int32_t krun_set_control_socket(uint32_t ctx_id, const char *c_socket_path);
 
+/* Attach the managed Guest freezer mailbox (Linux x86-64) before boot. */
+int32_t krun_enable_guest_gate_v1(uint32_t ctx_id);
+
 /* Provide portable snapshot RAM through an O_RDONLY regular-file descriptor.
  * Duplicates fd; the caller remains responsible for closing its descriptor.
  * Linux branchable restore only: RAM is copied into private sealable memfds.
