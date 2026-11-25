@@ -464,44 +464,8 @@ mod tests {
 
     fn default_vm_resources() -> VmResources {
         VmResources {
-            #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
-            guest_gate: false,
-            #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
-            guest_identity_helper: None,
-            live_cpu_growth: false,
-            live_memory_growth: false,
-            vm_config: VmConfig::default(),
-            firmware_config: None,
             kernel_cmdline: default_kernel_cmdline(),
-            kernel_bundle: Default::default(),
-            external_kernel: None,
-            fs: Default::default(),
-            vsock: Default::default(),
-            #[cfg(feature = "blk")]
-            block: Default::default(),
-            #[cfg(feature = "net")]
-            net: Default::default(),
-            gpu_virgl_flags: None,
-            gpu_shm_size: None,
-            #[cfg(feature = "gpu")]
-            display_backend: None,
-            #[cfg(feature = "gpu")]
-            displays: Vec::new(),
-            #[cfg(feature = "input")]
-            input_backends: Vec::new(),
-            #[cfg(feature = "vhost-user")]
-            vhost_user_devices: Vec::new(),
-            smbios_oem_strings: None,
-            nested_enabled: false,
-            split_irqchip: false,
-            serial_consoles: Vec::new(),
-            virtio_consoles: Vec::new(),
-            kernel_console: None,
-            #[cfg(target_os = "windows")]
-            console_output: None,
-            #[cfg(target_os = "windows")]
-            disable_implicit_console: false,
-            dhcp_client: false,
+            ..Default::default()
         }
     }
 
