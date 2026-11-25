@@ -2039,8 +2039,50 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) 
             // and those are cfg-gated out on aarch64-linux, where it'd otherwise
             // be an unused-variable error under -D warnings.
             let _arg = parts.next().map(str::trim).unwrap_or("");
+            #[cfg(all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                feature = "blk",
+                not(feature = "tee")
+            ))]
+            if vmm.lock().unwrap().deep_control_holds_vmm()
+                && !matches!(
+                    verb.as_str(),
+                    "STATUS"
+                        | "CAPTURE_INVENTORY"
+                        | "STANDBY_ENTER"
+                        | "STANDBY_QUERY"
+                        | "STANDBY_WAKE"
+                        | "GUEST_GATE_QUERY"
+                )
+            {
+                let _ = stream.write_all(b"ERR EBUSY native standby owns the VMM\n");
+                return;
+            }
             let lazy_ram = lazy_ram_unready(&verb);
             match verb.as_str() {
+                #[cfg(all(
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    feature = "blk",
+                    not(feature = "tee")
+                ))]
+                "CAPTURE_INVENTORY" if _arg.is_empty() => vmm
+                    .lock()
+                    .unwrap()
+                    .deep_virtio_inventory()
+                    .unwrap_or_else(|e| format!("ERR EIO {e}\n")),
+                #[cfg(all(
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    feature = "blk",
+                    not(feature = "tee")
+                ))]
+                "STANDBY_ENTER" | "STANDBY_QUERY" | "STANDBY_WAKE" => vmm
+                    .lock()
+                    .unwrap()
+                    .standby_control(&verb, _arg)
+                    .unwrap_or_else(|e| format!("ERR {e}\n")),
                 #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
                 "GUEST_GATE_PREPARE" | "GUEST_GATE_QUERY" | "GUEST_GATE_RELEASE"
                 | "GUEST_GATE_ABORT" => vmm

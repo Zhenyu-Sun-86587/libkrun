@@ -1647,6 +1647,13 @@ pub fn build_microvm(
         prototype_memory: None,
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         guest_gate: None,
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            feature = "blk",
+            not(feature = "tee")
+        ))]
+        capture_control: Default::default(),
 
         #[cfg(all(
             any(target_os = "linux", target_os = "macos"),

@@ -76,6 +76,10 @@ impl Default for GuestGate {
 }
 
 impl GuestGate {
+    pub fn allows_raw_standby(&self) -> bool {
+        self.session.as_ref().is_none_or(|s| s.phase.terminal())
+    }
+
     fn publish(&mut self, opcode: u32) {
         // Readers sample the revision before and after loading the command.
         let revision = u32::from_le_bytes(self.command[..4].try_into().unwrap()).wrapping_add(1);
