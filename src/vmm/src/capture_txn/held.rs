@@ -314,6 +314,7 @@ impl Vmm {
             *gate = DeviceSnapshot::ParkedGuestGate(ParkedState {
                 uplink,
                 acked_features: gate.acked_features(),
+                source_session: token.session,
                 anchor,
                 helper,
                 writer_hold_token: self

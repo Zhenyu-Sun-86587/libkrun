@@ -19,6 +19,9 @@ pub struct ParkedUplink {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ParkedState {
     pub acked_features: u64,
+    /// The kernel retains this counter across a RAM restore.
+    #[serde(default)]
+    pub source_session: u32,
     pub anchor: [u8; 16],
     pub helper: [u8; 32],
     /// Writer pivot challenge shared by the parked state and the Worker journal.
@@ -77,6 +80,7 @@ impl GuestGate {
             return Err("parked source or measured helper does not match the target".into());
         }
         self.anchor = state.anchor;
+        self.target_session = state.source_session.max(1);
         self.target_bound = true;
         Ok(())
     }
@@ -122,7 +126,7 @@ impl GuestGate {
                     self.request_digest = Some(digest);
                     self.identity_frame[..frame.len()].copy_from_slice(frame);
                     self.session = Some(Session {
-                        number: 1,
+                        number: self.target_session,
                         nonce,
                         freeze_ms: 0,
                         hold_ms: 0,
