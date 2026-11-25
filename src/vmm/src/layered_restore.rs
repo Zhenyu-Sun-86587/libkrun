@@ -560,7 +560,7 @@ impl Generation {
 
     /// Capture with each private region given its share of `limits`, in
     /// proportion to its size.
-    fn capture_quiesced_within(
+    pub(crate) fn capture_quiesced_within(
         &self,
         memory: &GuestMemoryMmap,
         excluded: &[u64],
@@ -1293,17 +1293,27 @@ fn copy_into_delta(
 
 /// When a capture compacts one region of a generation.
 #[derive(Clone, Copy, Debug)]
-struct CompactLimits {
+pub(crate) struct CompactLimits {
     trigger: usize,
     goal: usize,
     files: usize,
 }
 
 impl CompactLimits {
-    const DEFAULT: Self = Self {
+    pub(crate) const DEFAULT: Self = Self {
         trigger: COMPACT_TRIGGER,
         goal: COMPACT_GOAL,
         files: COMPACT_FILES,
+    };
+
+    // A held capture sends its extent index as JSON in a 64 KiB envelope.
+    // Fold the shortest unchanged runs before installing the new source view,
+    // so the next capture can also reuse this smaller set of mappings.
+    #[cfg(feature = "blk")]
+    pub(crate) const HANDOFF: Self = Self {
+        trigger: 288,
+        goal: 192,
+        files: 96,
     };
 
     /// This region's share of the limits, in proportion to its size.

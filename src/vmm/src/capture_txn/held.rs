@@ -391,7 +391,7 @@ impl Vmm {
         VmCheckpoint::deserialize(&checkpoint)?;
         devices::virtio::balloon::mark_guest_ram_shared();
         let generation = if self.has_layered_ram() {
-            self.capture_layered_ram()
+            self.capture_layered_ram_within(crate::layered_restore::CompactLimits::HANDOFF)
                 .map_err(|e| e.to_string())?
                 .ok_or("missing layered RAM")?
         } else {
@@ -601,7 +601,13 @@ impl Vmm {
                 Phase::Finished
             };
             let phase = record.phase;
-            if phase != Phase::Held {
+            // A failed capture taken from managed Standby still owns that
+            // exact parked gate. Only return it after the RAM remap is sound.
+            let can_abort_failed_hold = phase == Phase::FailedHeld && cancelled && record.from_standby;
+            if can_abort_failed_hold {
+                self.ensure_ram_mapping_valid().map_err(|e| e.to_string())?;
+            }
+            if phase != Phase::Held && !can_abort_failed_hold {
                 if (phase != decision && phase != Phase::Thawing)
                     || cancelled != record.cancelled
                     || decision == Phase::Held

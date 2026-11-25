@@ -841,12 +841,17 @@ impl Vmm {
 
     #[cfg(target_os = "linux")]
     fn capture_layered_ram(&mut self) -> Result<Option<layered_restore::Generation>> {
+        self.capture_layered_ram_within(layered_restore::CompactLimits::DEFAULT)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn capture_layered_ram_within(&mut self, limits: layered_restore::CompactLimits) -> Result<Option<layered_restore::Generation>> {
         self.ensure_ram_mapping_valid()?;
         let Some(current) = &self.layered_ram else {
             return Ok(None);
         };
         let (next, copied) = current
-            .capture_quiesced_excluding(&self.guest_memory, &self.layered_device_regions)
+            .capture_quiesced_within(&self.guest_memory, &self.layered_device_regions, limits)
             .map_err(|error| Error::Snapshot(format!("capture modified RAM pages: {error}")))?;
         if let Err(error) =
             next.rebase_quiesced_excluding(&self.guest_memory, &self.layered_device_regions)
