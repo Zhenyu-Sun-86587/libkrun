@@ -101,6 +101,10 @@ pub fn local_control_peer(stream: &UnixStream) -> bool {
     peer(stream).is_ok_and(|owner| owner.uid == 0 || owner.uid == unsafe { libc::geteuid() })
 }
 
+pub fn worker_recovery_peer(stream: &UnixStream) -> bool {
+    peer(stream).is_ok_and(|owner| owner.uid == 0)
+}
+
 fn immutable_descriptor(file: &File) -> io::Result<()> {
     let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
     if flags < 0 {
