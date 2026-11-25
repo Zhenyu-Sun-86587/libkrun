@@ -209,6 +209,13 @@ struct ContextConfig {
     tsi_port_map: Option<HashMap<u16, u16>>,
     egress_cidrs: Option<Vec<(std::net::IpAddr, u8)>>,
     control_socket_path: Option<PathBuf>,
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    worker_pivot: Option<worker_pivot::Config>,
     vsock_config: VsockConfig,
     #[cfg(feature = "blk")]
     block_cfgs: Vec<BlockDeviceConfig>,
@@ -527,6 +534,13 @@ struct PreparedSave {
 mod managed_disks;
 #[cfg(all(snapshot_supported, deferred_stream_supported))]
 mod prepared_saves;
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "blk",
+    not(feature = "tee")
+))]
+mod worker_pivot;
 
 #[cfg(all(snapshot_supported, deferred_stream_supported))]
 static PREPARED_SAVES: prepared_saves::PreparedSaves<PreparedSave> =
@@ -2030,7 +2044,17 @@ fn lazy_ram_unready(verb: &str) -> Option<String> {
     None
 }
 
-fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) {
+fn handle_control_stream(
+    mut stream: ControlStream,
+    vmm: &Arc<Mutex<vmm::Vmm>>,
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    worker_pivot: Option<&mut worker_pivot::Controller>,
+) {
     let response = match read_control_command(&mut stream) {
         Ok(buf) if buf.is_empty() => "ERR EINVAL empty command\n".to_string(),
         Ok(buf) => {
@@ -2069,6 +2093,8 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) 
                         | "CAPTURE_EXPORT"
                         | "CAPTURE_FINISH"
                         | "CAPTURE_CANCEL"
+                        | "CAPTURE_BLOCK_PIVOT"
+                        | "CAPTURE_BLOCK_PIVOT_ABORT"
                         | "STANDBY_ENTER"
                         | "STANDBY_QUERY"
                         | "STANDBY_WAKE"
@@ -2081,6 +2107,29 @@ fn handle_control_stream(mut stream: ControlStream, vmm: &Arc<Mutex<vmm::Vmm>>) 
             let lazy_ram = lazy_ram_unready(&verb);
             match verb.as_str() {
                 _ if lazy_ram.is_some() => format!("ERR EIO {}\n", lazy_ram.unwrap()),
+                #[cfg(all(
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    feature = "blk",
+                    not(feature = "tee")
+                ))]
+                "CAPTURE_BLOCK_PIVOT" | "CAPTURE_BLOCK_PIVOT_ABORT" => worker_pivot
+                    .ok_or_else(|| "ENOTSUP Worker block pivot was not configured".to_string())
+                    .and_then(|controller| controller.run(&verb, _arg, vmm))
+                    .unwrap_or_else(|e| format!("ERR {e}\n")),
+                #[cfg(all(
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    feature = "blk",
+                    not(feature = "tee")
+                ))]
+                "CAPTURE_FINISH" | "CAPTURE_CANCEL"
+                    if worker_pivot
+                        .as_ref()
+                        .is_some_and(|controller| controller.blocks_release(&verb, _arg)) =>
+                {
+                    "ERR EBUSY writer pivot still owns the held capture\n".into()
+                }
                 #[cfg(all(
                     target_os = "linux",
                     target_arch = "x86_64",
@@ -2722,7 +2771,17 @@ mod control_command_tests {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn start_control_socket(path: PathBuf, vmm: Arc<Mutex<vmm::Vmm>>) -> std::io::Result<()> {
+fn start_control_socket(
+    path: PathBuf,
+    vmm: Arc<Mutex<vmm::Vmm>>,
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    worker_pivot: Option<worker_pivot::Config>,
+) -> std::io::Result<()> {
     let _ = std::fs::remove_file(&path);
     let address = utils::SocketPath::new(&path)?;
     let listener = UnixListener::bind(address.path())?;
@@ -2730,9 +2789,26 @@ fn start_control_socket(path: PathBuf, vmm: Arc<Mutex<vmm::Vmm>>) -> std::io::Re
     std::thread::Builder::new()
         .name("krun control".into())
         .spawn(move || {
+            #[cfg(all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                feature = "blk",
+                not(feature = "tee")
+            ))]
+            let mut worker_pivot = worker_pivot.map(worker_pivot::Controller::new);
             for stream in listener.incoming() {
                 match stream {
-                    Ok(stream) => handle_control_stream(stream, &vmm),
+                    Ok(stream) => handle_control_stream(
+                        stream,
+                        &vmm,
+                        #[cfg(all(
+                            target_os = "linux",
+                            target_arch = "x86_64",
+                            feature = "blk",
+                            not(feature = "tee")
+                        ))]
+                        worker_pivot.as_mut(),
+                    ),
                     Err(e) => {
                         error!("control socket accept failed: {e}");
                         break;
@@ -6304,6 +6380,21 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         None => return -libc::ENOENT,
     };
 
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    if ctx_cfg.worker_pivot.is_some()
+        && (ctx_cfg.control_socket_path.is_none()
+            || !ctx_cfg.vmr.guest_gate
+            || ctx_cfg.vmr.block.list.is_empty())
+    {
+        set_last_error("Worker block pivot requires native held control and managed block devices");
+        return -libc::EINVAL;
+    }
+
     #[cfg(all(target_os = "linux", fork_supported, feature = "blk"))]
     if ctx_cfg.diskless_snapshot_ram.is_some()
         && (ctx_cfg.snapshot_dir.is_none()
@@ -6528,7 +6619,17 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
     #[cfg(any(unix, target_os = "windows"))]
     if let Some(control_socket_path) = ctx_cfg.control_socket_path.take()
-        && let Err(e) = start_control_socket(control_socket_path, _vmm.clone())
+        && let Err(e) = start_control_socket(
+            control_socket_path,
+            _vmm.clone(),
+            #[cfg(all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                feature = "blk",
+                not(feature = "tee")
+            ))]
+            ctx_cfg.worker_pivot.take(),
+        )
     {
         error!("Unable to start control socket: {e}");
         return -libc::EINVAL;

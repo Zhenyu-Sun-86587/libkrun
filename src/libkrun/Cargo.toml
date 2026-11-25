@@ -15,7 +15,7 @@ tee = ["vmm/tee", "devices/tee"]
 amd-sev = ["blk", "tee", "vmm/amd-sev", "devices/amd-sev", "init-blob/amd-sev"]
 tdx = ["blk", "tee", "vmm/tdx", "devices/tdx", "init-blob/tdx"]
 net = ["devices/net", "vmm/net"]
-blk = ["devices/blk", "vmm/blk"]
+blk = ["devices/blk", "vmm/blk", "dep:serde", "dep:serde_json"]
 gpu = ["vmm/gpu", "devices/gpu", "krun_display"]
 input = ["krun_input", "vmm/input", "devices/input"]
 virgl_resource_map2 = ["devices/virgl_resource_map2"]
@@ -38,6 +38,8 @@ init-blob = { package = "krun-init-blob", version = "=0.1.0-2.0.0-dev", path = "
 polly = { package = "krun-polly", version = "=0.1.0-2.0.0-dev", path = "../polly" }
 utils = { package = "krun-utils", version = "=0.1.0-2.0.0-dev", path = "../utils" }
 vmm = { package = "krun-vmm", version = "=0.1.0-2.0.0-dev", path = "../vmm" }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hvf = { package = "krun-hvf", version = "=0.1.0-2.0.0-dev", path = "../hvf" }
