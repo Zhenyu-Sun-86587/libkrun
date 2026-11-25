@@ -182,6 +182,8 @@ pub struct VmResources {
     /// Attach the host-controlled freezer mailbox to this managed profile.
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     pub guest_gate: bool,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    pub guest_identity_helper: Option<[u8; 32]>,
     /// The vCpu and memory configuration for this microVM.
     vm_config: VmConfig,
     /// The firmware to be loaded into the microVM.

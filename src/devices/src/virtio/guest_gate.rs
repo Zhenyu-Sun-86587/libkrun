@@ -56,6 +56,7 @@ struct Session {
 }
 
 pub struct GuestGate {
+    helper_digest: Option<[u8; 32]>,
     features: u64,
     interrupt: Option<InterruptTransport>,
     session: Option<Session>,
@@ -66,6 +67,7 @@ pub struct GuestGate {
 impl Default for GuestGate {
     fn default() -> Self {
         Self {
+            helper_digest: None,
             features: 0,
             interrupt: None,
             session: None,
@@ -76,6 +78,13 @@ impl Default for GuestGate {
 }
 
 impl GuestGate {
+    pub fn with_helper(helper_digest: Option<[u8; 32]>) -> Self {
+        Self {
+            helper_digest,
+            ..Self::default()
+        }
+    }
+
     pub fn allows_raw_standby(&self) -> bool {
         self.session.as_ref().is_none_or(|s| s.phase.terminal())
     }
@@ -151,7 +160,7 @@ impl GuestGate {
                     phase: Phase::Preparing,
                     error: 0,
                 });
-                self.publish(1);
+                self.publish(if self.helper_digest.is_some() { 4 } else { 1 });
             }
         } else {
             if fields.next().is_some() {
@@ -245,6 +254,12 @@ impl VirtioDevice for GuestGate {
         let Some(end) = index.checked_add(data.len()) else {
             return;
         };
+        if (64..96).contains(&index) && end <= 96 {
+            if let Some(digest) = &self.helper_digest {
+                data.copy_from_slice(&digest[index - 64..end - 64]);
+            }
+            return;
+        }
         if let Some(bytes) = self.command.get(index..end) {
             data.copy_from_slice(bytes);
         }

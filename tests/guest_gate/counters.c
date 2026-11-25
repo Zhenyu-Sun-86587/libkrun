@@ -10,6 +10,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/wait.h>
+#include <sys/mount.h>
 #include <unistd.h>
 
 static int count(void *arg)
@@ -56,6 +57,14 @@ static int count(void *arg)
 
 int main(void)
 {
+    if (access("/sbin/smolvm-identity-helper", X_OK) == 0 &&
+        mount("tmpfs", "/etc", "tmpfs", MS_NODEV | MS_NOSUID, "mode=0755") < 0)
+        return 1;
+    if (access("/dev/smolvm-identity", F_OK) == 0) {
+        int fd = open("/dev/smolvm-identity", O_RDWR | O_CLOEXEC);
+        if (fd >= 0 || errno != EPERM)
+            return 1;
+    }
     static char stack[65536] __attribute__((aligned(16)));
     for (unsigned int index = 0; index < 3; index++) {
         pid_t child;

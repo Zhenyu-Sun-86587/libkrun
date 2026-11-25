@@ -1773,7 +1773,9 @@ pub fn build_microvm(
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     if vm_resources.guest_gate {
-        let gate = Arc::new(Mutex::new(devices::virtio::guest_gate::GuestGate::default()));
+        let gate = Arc::new(Mutex::new(
+            devices::virtio::guest_gate::GuestGate::with_helper(vm_resources.guest_identity_helper),
+        ));
         attach_mmio_device(&mut vmm, "guest-gate".into(), intc.clone(), gate.clone())
             .map_err(StartMicrovmError::RegisterGuestGate)?;
         vmm.guest_gate = Some(gate);
