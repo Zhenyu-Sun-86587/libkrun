@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, Metadata};
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 
@@ -69,6 +69,44 @@ fn backing_id(metadata: &Metadata) -> String {
 }
 
 impl ResourceExport {
+    pub const MAX_DESCRIPTOR_BYTES: usize = 64 * 1024;
+    pub const MAX_BACKINGS: usize = 512;
+
+    /// Duplicate handles whose order matches the sorted backing IDs in the descriptor.
+    pub fn from_ordered_fds(descriptor: &[u8], fds: &[i32]) -> io::Result<Self> {
+        if descriptor.is_empty()
+            || descriptor.len() > Self::MAX_DESCRIPTOR_BYTES
+            || fds.is_empty()
+            || fds.len() > Self::MAX_BACKINGS
+        {
+            return Err(invalid(
+                "RAM import descriptor or handle count exceeds its bound",
+            ));
+        }
+        let descriptor: RamGenerationDescriptor = serde_json::from_slice(descriptor)?;
+        if descriptor.backing_sizes.len() != fds.len() {
+            return Err(invalid(
+                "RAM import handle count differs from the descriptor",
+            ));
+        }
+        let mut backings = BTreeMap::new();
+        for (id, fd) in descriptor.backing_sizes.keys().zip(fds) {
+            let fd = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 0) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            backings.insert(id.clone(), Arc::new(unsafe { File::from_raw_fd(fd) }));
+        }
+        Ok(Self {
+            descriptor,
+            backings,
+        })
+    }
+
+    pub fn descriptor_json(&self) -> io::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&self.descriptor)?)
+    }
+
     pub(crate) fn new(
         descriptions: Vec<RegionDescription>,
         files: impl Iterator<Item = Arc<File>>,

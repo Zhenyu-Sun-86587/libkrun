@@ -1198,6 +1198,34 @@ int32_t krun_set_snapshot_memory_fd(uint32_t ctx_id, int32_t fd);
  */
 int32_t krun_set_snapshot_memory_fd2(uint32_t ctx_id, int32_t fd, uint32_t flags);
 
+#if defined(__linux__)
+/* Export an in-process layered capture from the supplied snapshot directory.
+ * The callback receives UTF-8 JSON and immutable backing descriptors in sorted
+ * backing ID order. The strings and descriptors remain valid until it returns.
+ * A capture absent from this process or lacking a sealed layered backing fails.
+ */
+typedef int32_t (*krun_ram_resource_callback)(const uint8_t *descriptor,
+                                            size_t descriptor_len,
+                                            const int32_t *fds,
+                                            size_t fd_count,
+                                            void *opaque);
+int32_t krun_export_snapshot_ram_v1(const char *directory,
+                                   krun_ram_resource_callback callback,
+                                   void *opaque);
+
+/* Attach broker-leased O_RDONLY sealed backing FDs to a diskless snapshot
+ * context. Pass the unchanged descriptor and FDs in sorted backing ID order.
+ * The library duplicates the FDs. Set a snapshot directory containing the
+ * corresponding checkpoint.bin. A manifest.bin is unnecessary for this path.
+ * This entry point requires a context and checkpoint without block devices.
+ */
+int32_t krun_set_diskless_snapshot_ram_v1(uint32_t ctx_id,
+                                         const uint8_t *descriptor,
+                                         size_t descriptor_len,
+                                         const int32_t *fds,
+                                         size_t fd_count);
+#endif
+
 /**
  * Configures uid which is set right before the microVM is started.
  *
