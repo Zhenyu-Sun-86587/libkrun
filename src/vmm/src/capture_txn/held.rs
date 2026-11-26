@@ -316,7 +316,12 @@ impl Vmm {
         Ok(result)
     }
 
-    fn capture_boundary(&mut self, token: Token, managed: bool) -> Result<HeldExport, String> {
+    fn capture_boundary(
+        &mut self,
+        token: Token,
+        managed: bool,
+        from_standby: bool,
+    ) -> Result<HeldExport, String> {
         self.mmio_device_manager.quiesce_devices();
         self.devices_quiesced = true;
         self.mmio_device_manager.validate_standby_boundary()?;
@@ -378,8 +383,16 @@ impl Vmm {
         if devices.devices.len() != inventory.len() {
             return Err("incomplete device snapshot at capture boundary".into());
         }
+        let standby_pause_ns = if from_standby {
+            let paused_at = self.paused_at.ok_or("managed standby has no pause clock")?;
+            Some(Self::paused_duration_ns(paused_at.elapsed()))
+        } else {
+            None
+        };
+        let mut vm_state = self.save_vm_state().map_err(|e| e.to_string())?;
+        vm_state.standby_pause_ns = standby_pause_ns;
         let checkpoint = VmCheckpoint {
-            vm_state: self.save_vm_state().map_err(|e| e.to_string())?,
+            vm_state,
             vcpu_states,
             devices,
             ioapic: None,
@@ -533,7 +546,7 @@ impl Vmm {
                 return Err(format!("EIO pause: {e}"));
             }
             self.capture_control.capture.as_mut().unwrap().phase = Phase::FailedHeld;
-            match self.capture_boundary(token, managed) {
+            match self.capture_boundary(token, managed, from_standby) {
                 Ok(point) => {
                     let record = self.capture_control.capture.as_mut().unwrap();
                     record.point = Some(Arc::new(point));

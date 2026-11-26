@@ -1183,6 +1183,7 @@ impl Vm {
             pic_master,
             pic_slave,
             ioapic,
+            standby_pause_ns: None,
         })
     }
 
@@ -1322,7 +1323,9 @@ impl Vm {
         self.fd
             .set_pit2(&state.pitstate)
             .map_err(Error::VmSetPit2)?;
-        self.fd.set_clock(&state.clock).map_err(Error::VmSetClock)?;
+        self.fd
+            .set_clock(&state.clock_for_restore())
+            .map_err(Error::VmSetClock)?;
         self.fd
             .set_irqchip(&state.pic_master)
             .map_err(Error::VmSetIrqChip)?;
@@ -1467,6 +1470,7 @@ pub struct VmState {
     pic_master: kvm_irqchip,
     pic_slave: kvm_irqchip,
     ioapic: kvm_irqchip,
+    pub(crate) standby_pause_ns: Option<u64>,
 }
 
 /// VM-level state for an aarch64 checkpoint: the in-kernel vGICv3 registers.
@@ -3562,6 +3566,18 @@ impl VcpuState {
 
 #[cfg(target_arch = "x86_64")]
 impl VmState {
+    fn clock_for_restore(&self) -> kvm_clock_data {
+        let mut clock = self.clock;
+        if let Some(paused_ns) = self.standby_pause_ns {
+            // Begin at the original Standby boundary. KVM must not add the
+            // host wall time elapsed since export. Keep the original sample
+            // for TSC rebasing against the normalized destination clock.
+            clock.clock = clock.clock.saturating_sub(paused_ns);
+            clock.flags &= !KVM_CLOCK_REALTIME;
+        }
+        clock
+    }
+
     /// Serialize the VM-level KVM state (PIT, clock, PIC/IOAPIC) to a byte blob.
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -3582,6 +3598,7 @@ impl VmState {
             pic_master: de_pod(bytes, &mut pos)?,
             pic_slave: de_pod(bytes, &mut pos)?,
             ioapic: de_pod(bytes, &mut pos)?,
+            standby_pause_ns: None,
         })
     }
 }
@@ -4664,6 +4681,51 @@ mod tests {
 
         let missing_realtime = kvm_clock_data::default();
         assert!(validate_migration_clock_realtime(&missing_realtime, "source").is_err());
+    }
+
+    #[cfg(all(target_arch = "x86_64", snapshot_supported))]
+    #[test]
+    fn test_standby_checkpoint_clock_preserves_tsc_anchor() {
+        let mut checkpoint = crate::VmCheckpoint {
+            vm_state: VmState {
+                pitstate: Default::default(),
+                clock: kvm_clock_data {
+                    clock: 35_000_000_000,
+                    flags: KVM_CLOCK_REALTIME | KVM_CLOCK_HOST_TSC,
+                    realtime: 79_000_000_000,
+                    host_tsc: 92_000_000_000,
+                    ..Default::default()
+                },
+                pic_master: Default::default(),
+                pic_slave: Default::default(),
+                ioapic: Default::default(),
+                standby_pause_ns: None,
+            },
+            vcpu_states: Vec::new(),
+            devices: Default::default(),
+            ioapic: None,
+            cpu_growth: None,
+            memory_growth: None,
+        };
+        let ordinary = crate::VmCheckpoint::deserialize(&checkpoint.serialize()).unwrap();
+        assert_eq!(ordinary.vm_state.standby_pause_ns, None);
+        assert_eq!(ordinary.vm_state.clock_for_restore().clock, 35_000_000_000);
+        assert_ne!(
+            ordinary.vm_state.clock_for_restore().flags & KVM_CLOCK_REALTIME,
+            0
+        );
+
+        checkpoint.vm_state.standby_pause_ns = Some(24_000_000_000);
+        let encoded = checkpoint.serialize();
+        assert!(crate::VmCheckpoint::deserialize(&encoded[..9]).is_err());
+        let held = crate::VmCheckpoint::deserialize(&encoded).unwrap().vm_state;
+        assert_eq!(held.standby_pause_ns, Some(24_000_000_000));
+        assert_eq!(held.clock.clock, 35_000_000_000);
+        assert_eq!(held.clock.realtime, 79_000_000_000);
+        assert_eq!(held.clock.host_tsc, 92_000_000_000);
+        let restore = held.clock_for_restore();
+        assert_eq!(restore.clock, 11_000_000_000);
+        assert_eq!(restore.flags, KVM_CLOCK_HOST_TSC);
     }
 
     #[cfg(target_arch = "x86_64")]

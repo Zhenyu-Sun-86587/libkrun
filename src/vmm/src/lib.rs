@@ -310,6 +310,8 @@ pub struct VmCheckpoint {
 const HVF_CHECKPOINT_TAG: &[u8; 8] = b"SMVCHVF1";
 #[cfg(snapshot_supported)]
 const KVM_ARM_CHECKPOINT_TAG: &[u8; 8] = b"SMVCKVM1";
+#[cfg(snapshot_supported)]
+const KVM_X86_STANDBY_CHECKPOINT_TAG: &[u8; 8] = b"SMVCSBY1";
 
 /// A checkpoint blob split into its sections, before a hypervisor backend
 /// interprets the VM and vCPU sections.
@@ -339,6 +341,11 @@ impl VmCheckpoint {
         out.extend_from_slice(HVF_CHECKPOINT_TAG);
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         out.extend_from_slice(KVM_ARM_CHECKPOINT_TAG);
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if let Some(paused_ns) = self.vm_state.standby_pause_ns {
+            out.extend_from_slice(KVM_X86_STANDBY_CHECKPOINT_TAG);
+            out.extend_from_slice(&paused_ns.to_le_bytes());
+        }
         put(&mut out, &self.vm_state.serialize());
         out.extend_from_slice(&(self.vcpu_states.len() as u32).to_le_bytes());
         for v in &self.vcpu_states {
@@ -366,6 +373,22 @@ impl VmCheckpoint {
     /// Reconstruct from a blob produced by [`Self::serialize`], on this or (for
     /// a macOS arm64 checkpoint restored on Linux arm64) another backend.
     pub fn deserialize(bytes: &[u8]) -> std::result::Result<VmCheckpoint, String> {
+        if let Some(body) = bytes.strip_prefix(KVM_X86_STANDBY_CHECKPOINT_TAG) {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            {
+                let (paused_ns, sections) = body
+                    .split_first_chunk::<8>()
+                    .ok_or("truncated Standby clock state")?;
+                let mut checkpoint = Self::from_native_sections(Self::split_sections(sections)?)?;
+                checkpoint.vm_state.standby_pause_ns = Some(u64::from_le_bytes(*paused_ns));
+                return Ok(checkpoint);
+            }
+            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+            {
+                let _ = body;
+                return Err("This Standby checkpoint requires a Linux x86-64 host".into());
+            }
+        }
         if let Some(body) = bytes.strip_prefix(KVM_ARM_CHECKPOINT_TAG) {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             return kvm_import::import(Self::split_sections(body)?);
@@ -1281,6 +1304,18 @@ impl Vmm {
             .map_err(Error::Vm)
     }
 
+    #[cfg(snapshot_supported)]
+    fn restore_vm_state(&mut self, vm_state: &vstate::VmState) -> Result<()> {
+        self.vm.restore_state(vm_state).map_err(Error::Vm)?;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if vm_state.standby_pause_ns.is_some() {
+            // The new execution remains paused until activation. Its clock
+            // adjustment covers only this local wait.
+            self.paused_at = Some(Instant::now());
+        }
+        Ok(())
+    }
+
     /// Gets the the specified bus device.
     pub fn get_bus_device(
         &self,
@@ -1338,9 +1373,7 @@ impl Vmm {
         self.validate_restore_cpus(&checkpoint)?;
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         let _ = portable_clock;
-        self.vm
-            .restore_state(&checkpoint.vm_state)
-            .map_err(Error::Vm)?;
+        self.restore_vm_state(&checkpoint.vm_state)?;
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         if portable_clock {
             self.vm
@@ -1999,9 +2032,7 @@ impl Vmm {
         self.restore_incomplete = true;
         snapshot::read_guest_memory_into(&self.guest_memory, mem_descs, mem_in)
             .map_err(|e| Error::Snapshot(format!("guest-memory load: {e}")))?;
-        self.vm
-            .restore_state(&checkpoint.vm_state)
-            .map_err(Error::Vm)?;
+        self.restore_vm_state(&checkpoint.vm_state)?;
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         self.vm
             .rebase_vcpu_tsc_same_host(&checkpoint.vm_state, &mut checkpoint.vcpu_states)
@@ -2086,9 +2117,7 @@ impl Vmm {
         self.restore_incomplete = true;
         snapshot::copy_guest_memory(mem_clone, &self.guest_memory)
             .map_err(|e| Error::Snapshot(format!("guest-memory restore copy: {e}")))?;
-        self.vm
-            .restore_state(&checkpoint.vm_state)
-            .map_err(Error::Vm)?;
+        self.restore_vm_state(&checkpoint.vm_state)?;
         self.vm
             .rebase_vcpu_tsc_same_host(&checkpoint.vm_state, &mut checkpoint.vcpu_states)
             .map_err(Error::Vm)?;
@@ -2608,7 +2637,7 @@ impl Vmm {
             memory_growth: _,
         } = checkpoint;
         let restore = (|| {
-            self.vm.restore_state(&vm_state).map_err(Error::Vm)?;
+            self.restore_vm_state(&vm_state)?;
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             self.vm
                 .rebase_vcpu_tsc_same_host(&vm_state, &mut vcpu_states)
