@@ -8,7 +8,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 
 use vm_memory::mmap::{GuestRegionMmap, MmapRegion};
@@ -23,7 +23,8 @@ const REQUIRED_FEATURES: u32 = 0b11; // Strict no copy and private anonymous 4 K
 const PAGE: usize = 4096;
 const HOST_BASE: usize = 0x4000_0000_0000;
 const HOST_LIMIT: usize = 0x4800_0000_0000;
-const MAX_REGIONS: usize = 64;
+pub const MAX_RAM_REGIONS: usize = 64;
+pub const MAX_CHECKPOINT_BYTES: usize = 64 << 20;
 const RAM_PROT: libc::c_int = libc::PROT_READ | libc::PROT_WRITE;
 const RAM_FLAGS: libc::c_int = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
 
@@ -163,6 +164,140 @@ impl PreparedRam {
     }
 }
 
+/// Import RAM in the final Worker VMM process before it assumes the target's
+/// dedicated credentials. The source pidfd is closed before privileges are
+/// dropped. A QUERY or IMPORT failure still goes through the credential drop.
+///
+/// # Safety
+///
+/// The requirements of [`KernelCow::import_held`] apply. Call this once in the
+/// final, single-threaded bootstrap with only the target's authorized KVM
+/// group (if needed). Terminate the bootstrap on any failure.
+pub unsafe fn import_for_worker(
+    donor: OwnedFd,
+    layout: &RamLayout,
+    target_uid: libc::uid_t,
+    target_gid: libc::gid_t,
+    kvm_group: Option<libc::gid_t>,
+) -> io::Result<PreparedRam> {
+    if target_uid == 0 || target_gid == 0 || kvm_group == Some(0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Worker CoW requires a non-root target identity and KVM group",
+        ));
+    }
+    let mut threads = std::fs::read_dir("/proc/self/task")?;
+    if threads.next().transpose()?.is_none() || threads.next().transpose()?.is_some() {
+        return Err(io::Error::other(
+            "Worker CoW bootstrap must be single-threaded",
+        ));
+    }
+    drop(threads);
+    // SAFETY: this changes process attributes in the single-threaded bootstrap.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    const PTRACE: u32 = 1 << 19;
+    const SET_IDS: u32 = (1 << 6) | (1 << 7);
+    set_worker_capabilities(PTRACE, PTRACE | SET_IDS)?;
+    let prepared = KernelCow::probe().and_then(|kernel| {
+        // SAFETY: the caller is responsible for authentication and the held cut.
+        unsafe { kernel.import_held(donor.as_fd(), layout) }
+    });
+    drop(donor);
+    set_worker_capabilities(SET_IDS, SET_IDS)?;
+    drop_worker_credentials(target_uid, target_gid, kvm_group)?;
+    prepared
+}
+
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: libc::pid_t,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+impl CapHeader {
+    fn current() -> Self {
+        Self {
+            version: 0x2008_0522, // _LINUX_CAPABILITY_VERSION_3
+            pid: 0,
+        }
+    }
+}
+
+fn set_worker_capabilities(effective: u32, permitted: u32) -> io::Result<()> {
+    let data = [
+        CapData {
+            effective,
+            permitted,
+            inheritable: 0,
+        },
+        CapData::default(),
+    ];
+    // SAFETY: this is the v3 capability layout of the calling thread.
+    if unsafe { libc::syscall(libc::SYS_capset, &CapHeader::current(), data.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn drop_worker_credentials(
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    kvm_group: Option<libc::gid_t>,
+) -> io::Result<()> {
+    let groups = kvm_group.as_slice();
+    // SAFETY: valid group slice and scalar prctl/credential arguments. All
+    // calls occur before the trusted bootstrap starts VMM threads.
+    if unsafe {
+        libc::prctl(libc::PR_SET_KEEPCAPS, 0, 0, 0, 0) != 0
+            || libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL,
+                0,
+                0,
+                0,
+            ) != 0
+            || libc::setgroups(groups.len(), groups.as_ptr()) != 0
+            || libc::setresgid(gid, gid, gid) != 0
+            || libc::setresuid(uid, uid, uid) != 0
+    } {
+        return Err(io::Error::last_os_error());
+    }
+    set_worker_capabilities(0, 0)?;
+    let mut header = CapHeader::current();
+    let zero = [CapData::default(); 2];
+    let mut current = zero;
+    let (mut real_uid, mut effective_uid, mut saved_uid) = (0, 0, 0);
+    let (mut real_gid, mut effective_gid, mut saved_gid) = (0, 0, 0);
+    // SAFETY: capget receives two writable v3 capability words.
+    // getresuid/getresgid receive writable outputs of their declared sizes.
+    if unsafe {
+        libc::syscall(libc::SYS_capget, &mut header, current.as_mut_ptr()) != 0
+            || libc::getresuid(&mut real_uid, &mut effective_uid, &mut saved_uid) != 0
+            || libc::getresgid(&mut real_gid, &mut effective_gid, &mut saved_gid) != 0
+    } {
+        return Err(io::Error::last_os_error());
+    }
+    if [real_uid, effective_uid, saved_uid] != [uid; 3]
+        || [real_gid, effective_gid, saved_gid] != [gid; 3]
+        || current != zero
+    {
+        return Err(io::Error::other(
+            "Worker CoW credential drop was incomplete",
+        ));
+    }
+    Ok(())
+}
+
 fn syscall_result(status: libc::c_long) -> io::Result<()> {
     match status {
         0 => Ok(()),
@@ -213,7 +348,7 @@ impl RamLayout {
     pub fn new(regions: &[(GuestAddress, usize)]) -> io::Result<Self> {
         let invalid =
             || io::Error::new(io::ErrorKind::InvalidInput, "invalid fixed CoW RAM layout");
-        if regions.is_empty() || regions.len() > MAX_REGIONS {
+        if regions.is_empty() || regions.len() > MAX_RAM_REGIONS {
             return Err(invalid());
         }
         let mut previous_end = 0_u64;
@@ -243,6 +378,12 @@ impl RamLayout {
             });
         }
         Ok(Self(ranges))
+    }
+
+    /// The guest ranges required to reconstruct this fixed layout in the
+    /// target. Host addresses are derived from the validated layout profile.
+    pub fn regions(&self) -> impl Iterator<Item = (GuestAddress, usize)> + '_ {
+        self.0.iter().map(|range| (range.guest, range.length))
     }
 
     pub(crate) fn matches(&self, memory: &GuestMemoryMmap) -> bool {

@@ -184,10 +184,14 @@ mod smoke {
         use devices::virtio::guest_gate::TargetScope;
         use krun_vmm::Vmm;
         use krun_vmm::builder::{build_kernel_cow_source, build_kernel_cow_target};
+        use krun_vmm::kernel_cow::{MAX_CHECKPOINT_BYTES, PreparedRam, import_for_worker};
         use krun_vmm::resources::VmResources;
         use krun_vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
         use polly::event_manager::EventManager;
         use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::process::CommandExt;
         use std::path::{Path, PathBuf};
         use std::time::{Duration, Instant};
 
@@ -205,6 +209,9 @@ mod smoke {
             epoch: 7,
             context: [0x69; 32],
         };
+        const SOURCE_UID: u32 = 20101;
+        const TARGET_UID: u32 = 20102;
+        const KVM_GROUP: u32 = 20103;
 
         core::arch::global_asm!(include_str!("kernel_cow_guest.S"));
 
@@ -373,19 +380,17 @@ mod smoke {
                     .held_capture_control("CAPTURE_FINISH", &format!("{TOKEN} CONTINUE"))
                     .is_err()
             );
-            let (_, checkpoint) = source.held_kernel_cow_cut(TOKEN).unwrap();
             let mut output = io::stdout().lock();
-            writeln!(output, "{} {}", memory.num_regions(), checkpoint.len()).unwrap();
-            for region in memory.iter() {
-                writeln!(
-                    output,
-                    "{} {}",
-                    region.start_addr().raw_value(),
-                    region.len()
-                )
+            assert!(
+                source
+                    .held_kernel_cow_export("2 00000000000000000000000000000001")
+                    .is_err()
+            );
+            source
+                .held_kernel_cow_export(TOKEN)
+                .unwrap()
+                .write_to(&mut output)
                 .unwrap();
-            }
-            output.write_all(checkpoint).unwrap();
             output.flush().unwrap();
             let mut input = io::stdin().lock();
             line(&mut input, "imported");
@@ -393,7 +398,7 @@ mod smoke {
             source
                 .held_capture_control("CAPTURE_FINISH", &format!("{TOKEN} CONTINUE"))
                 .unwrap();
-            assert!(source.held_kernel_cow_cut(TOKEN).is_err());
+            assert!(source.held_kernel_cow_export(TOKEN).is_err());
             wait_for_phase(
                 || {
                     source
@@ -415,51 +420,226 @@ mod smoke {
             std::process::exit(0);
         }
 
-        fn length_pair(input: &mut impl BufRead) -> (usize, usize) {
-            let mut header = String::new();
-            input.read_line(&mut header).unwrap();
-            let (first, second) = header.trim_end().split_once(' ').unwrap();
-            (first.parse().unwrap(), second.parse().unwrap())
+        fn pidfd(pid: u32) -> OwnedFd {
+            // SAFETY: pidfd_open takes scalar arguments and returns a new FD.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            assert!(fd >= 0, "{}", io::Error::last_os_error());
+            // SAFETY: pidfd_open returned this new descriptor.
+            unsafe { OwnedFd::from_raw_fd(fd as i32) }
         }
 
-        pub(super) fn target(kernel: &KernelCow) {
+        pub(super) fn unauthorized_import(
+            kernel: &KernelCow,
+            source: u32,
+            ranges: &[(GuestAddress, usize)],
+        ) {
+            let donor = pidfd(source);
+            let layout = RamLayout::new(ranges).unwrap();
+            // SAFETY: the fixture owns both processes and keeps the donor
+            // held throughout. This subprocess has the target's ordinary UID.
+            let result = unsafe { kernel.import_held(donor.as_fd(), &layout) };
+            let error = result
+                .err()
+                .expect("ordinary target UID imported cross-UID RAM");
+            assert!(
+                matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)),
+                "{error}"
+            );
+        }
+
+        fn assert_worker_drop(raw_fd: i32) {
+            // SAFETY: scalar identity/fd queries and an attempt to regain UID 0,
+            // which must fail for the now unprivileged target.
+            unsafe {
+                assert_eq!(libc::fcntl(raw_fd, libc::F_GETFD), -1);
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+                assert_eq!(libc::geteuid(), TARGET_UID);
+                assert_eq!(libc::getegid(), TARGET_UID);
+                assert_eq!(libc::setuid(0), -1);
+                assert_eq!(libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0), 1);
+            }
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            for key in ["CapInh", "CapPrm", "CapEff", "CapAmb"] {
+                assert!(
+                    status.lines().any(|line| line.split_once(':').is_some_and(
+                        |(field, value)| field == key && value.trim() == "0000000000000000"
+                    )),
+                    "{key} wasn't cleared"
+                );
+            }
+        }
+
+        pub(super) fn failed_worker_import() {
+            let bad: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+            let raw_fd = bad.as_raw_fd();
+            // SAFETY: this disposable bootstrap deliberately passes a
+            // non-pidfd. The kernel rejects it before examining any source.
+            let result = unsafe {
+                import_for_worker(bad, &layout(), TARGET_UID, TARGET_UID, Some(KVM_GROUP))
+            };
+            assert!(result.is_err());
+            assert_worker_drop(raw_fd);
+        }
+
+        fn deny_cow_in_guest_runtime() {
+            KernelCow::probe().expect("unfiltered CoW probe");
+            let marker = std::fs::read_to_string("/sys/kernel/smolvm_cow/abi").unwrap();
+            let nr = marker
+                .lines()
+                .find_map(|line| line.strip_prefix("syscall_nr="))
+                .unwrap()
+                .parse::<u32>()
+                .unwrap();
+            let op = |code: u16, jump_on_false: u8, arg: u32| libc::sock_filter {
+                code,
+                jt: 0,
+                jf: jump_on_false,
+                k: arg,
+            };
+            // Test filter for this known x86_64 lab process. It leaves KVM
+            // available but rejects any query or import after the credential drop.
+            let mut instructions = [
+                op((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 0, 0),
+                op((libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16, 1, nr),
+                op(
+                    (libc::BPF_RET | libc::BPF_K) as u16,
+                    0,
+                    libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+                ),
+                op(
+                    (libc::BPF_RET | libc::BPF_K) as u16,
+                    0,
+                    libc::SECCOMP_RET_ALLOW,
+                ),
+            ];
+            let program = libc::sock_fprog {
+                len: instructions.len() as u16,
+                filter: instructions.as_mut_ptr(),
+            };
+            // SAFETY: the kernel copies the bounded classic BPF program.
+            assert_eq!(
+                unsafe {
+                    libc::prctl(
+                        libc::PR_SET_SECCOMP,
+                        libc::SECCOMP_MODE_FILTER,
+                        &raw const program,
+                    )
+                },
+                0
+            );
+            let rejected = KernelCow::probe()
+                .err()
+                .expect("seccomp allowed the private CoW syscall");
+            assert_eq!(rejected.raw_os_error(), Some(libc::EPERM));
+        }
+
+        fn worker_import(
+            source: u32,
+            donor: OwnedFd,
+            ranges: &[(GuestAddress, usize)],
+        ) -> PreparedRam {
+            let exe = std::env::current_exe().unwrap();
+            assert!(
+                Command::new(&exe)
+                    .arg("--bootstrap-failure")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            // The first import targets the real donor layout without privileges.
+            let mut reject = Command::new(exe);
+            reject.arg("--import-denied").arg(source.to_string());
+            for (guest, size) in ranges {
+                reject
+                    .arg(guest.raw_value().to_string())
+                    .arg(size.to_string());
+            }
+            assert!(
+                reject
+                    .uid(TARGET_UID)
+                    .gid(TARGET_UID)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+
+            let layout = RamLayout::new(ranges).unwrap();
+            let raw_fd = donor.as_raw_fd();
+            // SAFETY: exact source is the held, fixture-owned donor. This is the
+            // single-threaded final target before it opens its own KVM handle.
+            let memory = unsafe {
+                import_for_worker(donor, &layout, TARGET_UID, TARGET_UID, Some(KVM_GROUP))
+            }
+            .unwrap();
+            assert_worker_drop(raw_fd);
+            deny_cow_in_guest_runtime();
+            println!(
+                "libkrun Worker CoW: UID {TARGET_UID} denied for UID {SOURCE_UID}, bootstrap succeeded, failure drops privileges, pidfds closed, capabilities cleared, post-drop syscall denied"
+            );
+            memory
+        }
+
+        pub(super) fn target(kernel: &KernelCow, cross_uid: bool) {
+            if cross_uid {
+                let kvm = std::fs::metadata("/dev/kvm").unwrap();
+                assert_eq!(kvm.gid(), KVM_GROUP, "use the dedicated nested KVM fixture");
+                assert_eq!(kvm.mode() & 0o777, 0o660);
+            }
             let fixture = tempfile::tempdir().unwrap();
+            if cross_uid {
+                std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
             let path = fixture.path().join("guest.elf");
             fixture_elf(&path);
-            let mut source = Donor(
-                Command::new(std::env::current_exe().unwrap())
-                    .arg("--vmm-donor")
-                    .arg(&path)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .spawn()
-                    .unwrap(),
-            );
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--vmm-donor")
+                .arg(&path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            if cross_uid {
+                command.uid(SOURCE_UID).gid(KVM_GROUP);
+            }
+            let mut source = Donor(command.spawn().unwrap());
             let mut input = source.0.stdin.take().unwrap();
             let mut output = io::BufReader::new(source.0.stdout.take().unwrap());
-            let (count, length) = length_pair(&mut output);
-            let ranges = (0..count)
-                .map(|_| {
-                    let (guest, length) = length_pair(&mut output);
-                    (GuestAddress(guest as u64), length)
+            let mut header = String::new();
+            output.read_line(&mut header).unwrap();
+            let header: serde_json::Value =
+                serde_json::from_str(header.strip_prefix("OK ").unwrap()).unwrap();
+            assert_eq!(header["protocol"], "KernelCowHeld/1");
+            assert_eq!(header["session"], 1);
+            assert_eq!(header["hold_token"], TOKEN.split_once(' ').unwrap().1);
+            let length = header["checkpoint_bytes"].as_u64().unwrap() as usize;
+            assert!((1..=MAX_CHECKPOINT_BYTES).contains(&length));
+            let ranges = header["regions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|region| {
+                    (
+                        GuestAddress(region["guest_start"].as_u64().unwrap()),
+                        region["size"].as_u64().unwrap() as usize,
+                    )
                 })
                 .collect::<Vec<_>>();
             let mut checkpoint = vec![0; length];
             output.read_exact(&mut checkpoint).unwrap();
-            let layout = RamLayout::new(&ranges).unwrap();
-            // SAFETY: a live direct child awaits this fixture's import acknowledgement.
-            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, source.0.id(), 0) };
-            assert!(fd >= 0, "{}", io::Error::last_os_error());
-            // SAFETY: pidfd_open returned this new descriptor.
-            let pidfd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
-            // SAFETY: the libkrun actor is held and all writers have been quiesced.
-            let memory = unsafe { kernel.import_held(pidfd.as_fd(), &layout) }.unwrap();
-            drop(pidfd);
+            fixture.close().unwrap();
+            let source_pid = source.0.id();
+            let donor = pidfd(source_pid);
+            let memory = if cross_uid {
+                worker_import(source_pid, donor, &ranges)
+            } else {
+                let layout = RamLayout::new(&ranges).unwrap();
+                // SAFETY: the libkrun actor is held and all writers have been quiesced.
+                unsafe { kernel.import_held(donor.as_fd(), &layout) }.unwrap()
+            };
             writeln!(input, "imported").unwrap();
             line(&mut output, "resumed");
             let mut events = EventManager::new().unwrap();
             let (sender, _receiver) = crossbeam_channel::unbounded();
-            std::fs::remove_file(&path).unwrap();
             let mut config = resources(path);
             config.guest_target = Some(TARGET);
             let child =
@@ -500,10 +680,30 @@ mod smoke {
             Some("--vmm-donor") => {
                 held_vmm::donor(kernel, std::env::args_os().nth(2).unwrap().into())
             }
+            #[cfg(feature = "blk")]
+            Some("--import-denied") => {
+                let mut args = std::env::args().skip(2);
+                let pid = args.next().unwrap().parse().unwrap();
+                let mut ranges = Vec::new();
+                while let Some(guest) = args.next() {
+                    ranges.push((
+                        GuestAddress(guest.parse().unwrap()),
+                        args.next().unwrap().parse().unwrap(),
+                    ));
+                }
+                held_vmm::unauthorized_import(&kernel, pid, &ranges);
+            }
+            #[cfg(feature = "blk")]
+            Some("--cross-uid") => {
+                target(&kernel);
+                held_vmm::target(&kernel, true);
+            }
+            #[cfg(feature = "blk")]
+            Some("--bootstrap-failure") => held_vmm::failed_worker_import(),
             _ => {
                 target(&kernel);
                 #[cfg(feature = "blk")]
-                held_vmm::target(&kernel);
+                held_vmm::target(&kernel, false);
             }
         }
     }

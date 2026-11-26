@@ -236,6 +236,13 @@ struct ContextConfig {
         feature = "blk",
         not(feature = "tee")
     ))]
+    worker_kernel_cow: Option<worker_kernel_cow::Boot>,
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
     target_authority: Option<std::os::unix::net::UnixDatagram>,
     vsock_config: VsockConfig,
     #[cfg(feature = "blk")]
@@ -569,6 +576,13 @@ mod prepared_saves;
     not(feature = "tee")
 ))]
 mod worker_pivot;
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "blk",
+    not(feature = "tee")
+))]
+mod worker_kernel_cow;
 
 #[cfg(all(snapshot_supported, deferred_stream_supported))]
 static PREPARED_SAVES: prepared_saves::PreparedSaves<PreparedSave> =
@@ -2120,6 +2134,18 @@ fn handle_control_stream(
                 feature = "blk",
                 not(feature = "tee")
             ))]
+            if verb.starts_with("CAPTURE_KERNEL_")
+                && !vmm::retained_fds::worker_recovery_peer(&stream)
+            {
+                let _ = stream.write_all(b"ERR EPERM kernel CoW requires the Worker control peer\n");
+                return;
+            }
+            #[cfg(all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                feature = "blk",
+                not(feature = "tee")
+            ))]
             if vmm.lock().unwrap().deep_control_holds_vmm()
                 && !matches!(
                     verb.as_str(),
@@ -2128,6 +2154,9 @@ fn handle_control_stream(
                         | "CAPTURE_PREPARE"
                         | "CAPTURE_QUERY"
                         | "CAPTURE_EXPORT"
+                        | "CAPTURE_KERNEL_PREPARE"
+                        | "CAPTURE_KERNEL_EXPORT"
+                        | "CAPTURE_KERNEL_IMPORTED"
                         | "CAPTURE_RECOVER_FDS"
                         | "CAPTURE_FINISH"
                         | "CAPTURE_CANCEL"
@@ -2215,6 +2244,45 @@ fn handle_control_stream(
                         }
                         Err(e) => format!("ERR {e}\n"),
                     }
+                }
+                #[cfg(all(
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    feature = "blk",
+                    not(feature = "tee")
+                ))]
+                "CAPTURE_KERNEL_PREPARE" => vmm
+                    .lock()
+                    .unwrap()
+                    .prepare_held_kernel_cow(_arg)
+                    .unwrap_or_else(|e| format!("ERR {e}\n")),
+                #[cfg(all(
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    feature = "blk",
+                    not(feature = "tee")
+                ))]
+                "CAPTURE_KERNEL_EXPORT" => {
+                    let point = vmm.lock().unwrap().held_kernel_cow_export(_arg);
+                    match point {
+                        Ok(point) => {
+                            let _ = point.send_to(&stream);
+                            return;
+                        }
+                        Err(e) => format!("ERR {e}\n"),
+                    }
+                }
+                #[cfg(all(
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    feature = "blk",
+                    not(feature = "tee")
+                ))]
+                "CAPTURE_KERNEL_IMPORTED" => {
+                    let mut vmm = vmm.lock().unwrap();
+                    vmm.confirm_held_kernel_cow_import(_arg)
+                        .and_then(|()| vmm.held_capture_control("CAPTURE_QUERY", _arg))
+                        .unwrap_or_else(|e| format!("ERR {e}\n"))
                 }
                 #[cfg(all(
                     target_os = "linux",
@@ -6485,8 +6553,14 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     ))]
     {
         let durable = ctx_cfg.worker_statepoint.is_some();
+        let kernel_cow = ctx_cfg.worker_kernel_cow.is_some();
+        if let Err(error) = worker_kernel_cow::validate(&ctx_cfg, parked_target) {
+            set_last_error(error);
+            return -libc::EINVAL;
+        }
         if (parked_target
             && !durable
+            && !kernel_cow
             && (ctx_cfg.snapshot_dir.is_none() || ctx_cfg.diskless_snapshot_ram.is_none()))
             || (durable
                 && (!parked_target
@@ -6629,6 +6703,22 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         ctx_cfg.vmr.set_gpu_shm_size(shm_size);
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    if let Err(error) = worker_kernel_cow::verify_writers(
+        ctx_cfg.worker_kernel_cow.as_ref(),
+        &mut ctx_cfg.vmr,
+        ctx_cfg.worker_pivot.as_ref(),
+        ctx_cfg.worker_restore.as_ref(),
+    ) {
+        set_last_error(error);
+        return -libc::EINVAL;
+    }
+
     // setuid/setgid privilege dropping is Unix-only.
     #[cfg(not(target_os = "windows"))]
     if let Some(gid) = ctx_cfg.vmm_gid
@@ -6766,13 +6856,50 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     let restore_ctx: Option<vmm::builder::RestoreCtx> = None;
 
     lk_timing!("before build_microvm");
-    let _vmm = match vmm::builder::build_microvm(
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    let build = match ctx_cfg.worker_kernel_cow.take() {
+        Some(worker_kernel_cow::Boot::Source(kernel)) => vmm::builder::build_kernel_cow_source(
+            &ctx_cfg.vmr,
+            &mut event_manager,
+            ctx_cfg.shutdown_efd,
+            sender,
+            kernel,
+        ),
+        Some(worker_kernel_cow::Boot::Target { ram, checkpoint }) => vmm::builder::build_kernel_cow_target(
+            &ctx_cfg.vmr,
+            &mut event_manager,
+            ctx_cfg.shutdown_efd,
+            sender,
+            ram,
+            checkpoint,
+        ),
+        None => vmm::builder::build_microvm(
+            &ctx_cfg.vmr,
+            &mut event_manager,
+            ctx_cfg.shutdown_efd,
+            sender,
+            restore_ctx,
+        ),
+    };
+    #[cfg(not(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    )))]
+    let build = vmm::builder::build_microvm(
         &ctx_cfg.vmr,
         &mut event_manager,
         ctx_cfg.shutdown_efd,
         sender,
         restore_ctx,
-    ) {
+    );
+    let _vmm = match build {
         Ok(vmm) => vmm,
         Err(e) => {
             let errno = if matches!(e, vmm::builder::StartMicrovmError::HostNetwork(_)) {

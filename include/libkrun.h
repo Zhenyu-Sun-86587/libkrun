@@ -1346,6 +1346,28 @@ int32_t krun_set_diskless_snapshot_ram_v1(uint32_t ctx_id,
                                          size_t descriptor_len,
                                          const int32_t *fds,
                                          size_t fd_count);
+#if defined(__x86_64__)
+/* Private managed Worker ABI, Linux x86_64 with block support. */
+struct krun_worker_cow_range_v1 {
+    uint64_t guest_start;
+    uint64_t size;
+};
+int32_t krun_enable_worker_kernel_cow_v1(uint32_t ctx_id);
+
+/* Takes ownership of donor_pidfd even on error. The trusted supervisor must
+ * keep the authorized source held and match these ranges and checkpoint to
+ * that source incarnation. Call in the final single-threaded target process
+ * before seccomp. On success the process is permanently using uid/gid, with
+ * only the optional kvm_group (0 for none). Abort launch on any error.
+ * The context still requires the parked target authority and writer set. */
+int32_t krun_import_worker_kernel_cow_v1(uint32_t ctx_id,
+                                        int32_t donor_pidfd,
+                                        const struct krun_worker_cow_range_v1 *ranges,
+                                        size_t range_count,
+                                        const uint8_t *checkpoint,
+                                        size_t checkpoint_len,
+                                        uint32_t uid, uint32_t gid, uint32_t kvm_group);
+#endif
 #endif
 
 /**

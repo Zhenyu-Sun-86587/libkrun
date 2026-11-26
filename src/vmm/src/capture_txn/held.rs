@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-use crate::kernel_cow::RamLayout;
+use crate::kernel_cow::{MAX_CHECKPOINT_BYTES, RamLayout};
 use crate::managed_block_restore::{
     ParkedWriter, ParkedWriterTransition, parked_block_binding, verify_parked_block_binding,
 };
@@ -11,6 +11,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use vm_memory::Address;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Token {
@@ -57,7 +58,7 @@ enum CapturePoint {
     Native(Arc<HeldExport>),
     KernelCow {
         layout: RamLayout,
-        checkpoint: Vec<u8>,
+        checkpoint: Arc<[u8]>,
         imported: bool,
     },
 }
@@ -134,6 +135,37 @@ impl HeldExport {
         for fd in &self.backings {
             crate::retained_fds::send_fd(stream, fd.as_raw_fd(), deadline)?;
         }
+        Ok(())
+    }
+}
+
+pub struct HeldKernelCowExport {
+    token: Token,
+    layout: RamLayout,
+    checkpoint: Arc<[u8]>,
+}
+
+impl HeldKernelCowExport {
+    pub fn send_to(&self, mut stream: &UnixStream) -> io::Result<()> {
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        self.write_to(&mut stream)
+    }
+
+    pub fn write_to(&self, output: &mut impl Write) -> io::Result<()> {
+        let regions = self
+            .layout
+            .regions()
+            .map(|(guest, size)| json!({"guest_start":guest.raw_value(),"size":size}))
+            .collect::<Vec<_>>();
+        let head = json!({
+            "protocol":"KernelCowHeld/1",
+            "session":self.token.session,
+            "hold_token":format!("{:032x}",self.token.nonce),
+            "regions":regions,
+            "checkpoint_bytes":self.checkpoint.len(),
+        });
+        writeln!(output, "OK {head}")?;
+        output.write_all(&self.checkpoint)?;
         Ok(())
     }
 }
@@ -422,9 +454,12 @@ impl Vmm {
         VmCheckpoint::deserialize(&checkpoint)?;
         devices::virtio::balloon::mark_guest_ram_shared();
         if let Some(layout) = kernel_ram {
+            if checkpoint.len() > MAX_CHECKPOINT_BYTES {
+                return Err("captured checkpoint exceeds the Kernel CoW handoff limit".into());
+            }
             return Ok(CapturePoint::KernelCow {
                 layout,
-                checkpoint,
+                checkpoint: checkpoint.into(),
                 imported: false,
             });
         }
@@ -783,9 +818,9 @@ impl Vmm {
         }
     }
 
-    /// The caller keeps the source held until the target acknowledges import.
-    /// Leaving the held phase invalidates this view of the live source RAM.
-    pub fn held_kernel_cow_cut(&self, arguments: &str) -> Result<(&RamLayout, &[u8]), String> {
+    /// Return immutable metadata only. The Worker must keep the source held
+    /// and supply a separately authenticated pidfd for the import.
+    pub fn held_kernel_cow_export(&self, arguments: &str) -> Result<HeldKernelCowExport, String> {
         let (token, fields) = Token::parse(arguments)?;
         if !fields.is_empty() {
             return Err("EINVAL trailing Kernel CoW cut arguments".into());
@@ -799,7 +834,11 @@ impl Vmm {
         match capture.point.as_ref() {
             Some(CapturePoint::KernelCow {
                 layout, checkpoint, ..
-            }) if capture.phase == Phase::Held => Ok((layout, checkpoint)),
+            }) if capture.phase == Phase::Held => Ok(HeldKernelCowExport {
+                token,
+                layout: layout.clone(),
+                checkpoint: Arc::clone(checkpoint),
+            }),
             _ => Err("EBUSY no Kernel CoW RAM at the held boundary".into()),
         }
     }
