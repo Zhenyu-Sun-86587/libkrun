@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+use crate::kernel_cow::RamLayout;
 use crate::managed_block_restore::{
     ParkedWriter, ParkedWriterTransition, parked_block_binding, verify_parked_block_binding,
 };
@@ -46,13 +47,29 @@ enum Phase {
     ReturnedStandby,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RamBackend {
+    Native,
+    KernelCow,
+}
+
+enum CapturePoint {
+    Native(Arc<HeldExport>),
+    KernelCow {
+        layout: RamLayout,
+        checkpoint: Vec<u8>,
+        imported: bool,
+    },
+}
+
 pub(super) struct Capture {
     token: Token,
     managed: bool,
+    backend: RamBackend,
     from_standby: bool,
     cancelled: bool,
     phase: Phase,
-    point: Option<Arc<HeldExport>>,
+    point: Option<CapturePoint>,
     writers: Vec<ParkedWriter>,
     writers_committed: bool,
     stop_reserved: bool,
@@ -321,7 +338,8 @@ impl Vmm {
         token: Token,
         managed: bool,
         from_standby: bool,
-    ) -> Result<HeldExport, String> {
+        kernel_ram: Option<RamLayout>,
+    ) -> Result<CapturePoint, String> {
         self.mmio_device_manager.quiesce_devices();
         self.devices_quiesced = true;
         self.mmio_device_manager.validate_standby_boundary()?;
@@ -332,7 +350,7 @@ impl Vmm {
         let inventory = self.mmio_device_manager.capture_inventory()?;
         let vcpu_states = self.save_vcpu_states().map_err(|e| e.to_string())?;
         if vcpu_states.iter().any(|v| v.runs_nested_guest()) {
-            return Err("nested KVM memory cannot form a sealed generation".into());
+            return Err("nested KVM memory cannot form a held capture".into());
         }
         let mut devices = self.snapshot_devices();
         if managed {
@@ -403,6 +421,13 @@ impl Vmm {
         // Reject a malformed state section before changing the source's RAM view.
         VmCheckpoint::deserialize(&checkpoint)?;
         devices::virtio::balloon::mark_guest_ram_shared();
+        if let Some(layout) = kernel_ram {
+            return Ok(CapturePoint::KernelCow {
+                layout,
+                checkpoint,
+                imported: false,
+            });
+        }
         let generation = if self.has_layered_ram() {
             self.capture_layered_ram_within(crate::layered_restore::CompactLimits::HANDOFF)
                 .map_err(|e| e.to_string())?
@@ -437,15 +462,34 @@ impl Vmm {
            "session":token.session,"hold_token":format!("{:032x}",token.nonce),"clone_ready":false,
            "checkpoint_bytes":checkpoint.len(),"descriptor_bytes":descriptor.len(),"fd_count":backings.len(),
            "devices":inventory})).into_bytes();
-        Ok(HeldExport {
+        Ok(CapturePoint::Native(Arc::new(HeldExport {
             header,
             checkpoint,
             descriptor,
             backings,
-        })
+        })))
     }
 
     pub fn held_capture_control(&mut self, verb: &str, arguments: &str) -> Result<String, String> {
+        self.held_capture_control_with_backend(verb, arguments, RamBackend::Native)
+    }
+
+    /// Enter the same CPU and device boundary used for native capture, leaving
+    /// RAM in place for the experimental, synchronous import.
+    pub fn prepare_held_kernel_cow(&mut self, arguments: &str) -> Result<String, String> {
+        self.held_capture_control_with_backend(
+            "CAPTURE_PREPARE",
+            &format!("{arguments} parked"),
+            RamBackend::KernelCow,
+        )
+    }
+
+    fn held_capture_control_with_backend(
+        &mut self,
+        verb: &str,
+        arguments: &str,
+        backend: RamBackend,
+    ) -> Result<String, String> {
         let (token, fields) = Token::parse(arguments)?;
         match (verb, fields.as_slice()) {
             ("CAPTURE_PREPARE", ["raw" | "parked"])
@@ -511,18 +555,35 @@ impl Vmm {
             }
             self.standby_profile(&self.mmio_device_manager.capture_inventory()?)
                 .map_err(|e| format!("ENOTSUP {e}"))?;
-            if !self.has_layered_ram() {
-                let regions = snapshot::memfd_region_descs(&self.guest_memory);
-                if regions.is_empty() || regions.iter().any(|r| r.fd < 0) {
-                    return Err(
-                        "ENOTSUP held capture requires a complete file-backed RAM generation"
-                            .into(),
-                    );
+            let kernel_ram = match backend {
+                RamBackend::Native => {
+                    if !self.has_layered_ram() {
+                        let regions = snapshot::memfd_region_descs(&self.guest_memory);
+                        if regions.is_empty() || regions.iter().any(|r| r.fd < 0) {
+                            return Err(
+                                "ENOTSUP held capture requires a complete file-backed RAM generation"
+                                    .into(),
+                            );
+                        }
+                    }
+                    None
                 }
-            }
+                RamBackend::KernelCow => {
+                    if !self.kernel_cow_ram {
+                        return Err(
+                            "ENOTSUP VM was not built with the kernel CoW RAM profile".into()
+                        );
+                    }
+                    Some(
+                        RamLayout::from_fixed_memory(&self.guest_memory)
+                            .map_err(|e| format!("ENOTSUP {e}"))?,
+                    )
+                }
+            };
             self.capture_control.capture = Some(Capture {
                 token,
                 managed,
+                backend,
                 from_standby,
                 cancelled: false,
                 phase: Phase::Unknown,
@@ -546,10 +607,10 @@ impl Vmm {
                 return Err(format!("EIO pause: {e}"));
             }
             self.capture_control.capture.as_mut().unwrap().phase = Phase::FailedHeld;
-            match self.capture_boundary(token, managed, from_standby) {
+            match self.capture_boundary(token, managed, from_standby, kernel_ram) {
                 Ok(point) => {
                     let record = self.capture_control.capture.as_mut().unwrap();
-                    record.point = Some(Arc::new(point));
+                    record.point = Some(point);
                     record.phase = Phase::Held;
                 }
                 Err(e) => {
@@ -559,11 +620,14 @@ impl Vmm {
             }
         } else if !matching {
             return Err("ESTALE unknown capture session".into());
-        } else if verb == "CAPTURE_PREPARE" && current.unwrap().managed != (fields == ["parked"]) {
+        } else if verb == "CAPTURE_PREPARE"
+            && current.is_some_and(|c| c.backend != backend || c.managed != (fields == ["parked"]))
+        {
             return Err("EINVAL capture mode differs from original request".into());
         } else if verb == "CAPTURE_DROP_EXPORT" {
             let record = self.capture_control.capture.as_mut().unwrap();
             if !record.managed
+                || record.backend == RamBackend::KernelCow
                 || !matches!(
                     record.phase,
                     Phase::Held | Phase::Finished | Phase::ReturnedStandby | Phase::Thawing
@@ -577,6 +641,7 @@ impl Vmm {
             if !record.managed
                 || record.phase != Phase::Held
                 || (!record.writers.is_empty() && !record.writers_committed)
+                || record.backend == RamBackend::KernelCow
             {
                 return Err("EBUSY stop requires the current complete parked capture".into());
             }
@@ -586,6 +651,18 @@ impl Vmm {
             let cancelled = verb == "CAPTURE_CANCEL";
             if record.stop_reserved && fields != ["KEEP_HELD"] {
                 return Err("EBUSY the Worker reserved this capture for stop".into());
+            }
+            if !cancelled
+                && fields != ["KEEP_HELD"]
+                && matches!(
+                    record.point,
+                    Some(CapturePoint::KernelCow {
+                        imported: false,
+                        ..
+                    })
+                )
+            {
+                return Err("EBUSY Kernel CoW target has not confirmed import".into());
             }
             if !record.writers.is_empty()
                 && !cancelled
@@ -616,7 +693,8 @@ impl Vmm {
             let phase = record.phase;
             // A failed capture taken from managed Standby still owns that
             // exact parked gate. Only return it after the RAM remap is sound.
-            let can_abort_failed_hold = phase == Phase::FailedHeld && cancelled && record.from_standby;
+            let can_abort_failed_hold =
+                phase == Phase::FailedHeld && cancelled && record.from_standby;
             if can_abort_failed_hold {
                 self.ensure_ram_mapping_valid().map_err(|e| e.to_string())?;
             }
@@ -696,9 +774,54 @@ impl Vmm {
         {
             return Err("EBUSY capture is unavailable".into());
         }
-        capture
-            .point
-            .clone()
-            .ok_or_else(|| "EIO capture is incomplete".into())
+        match capture.point.as_ref() {
+            Some(CapturePoint::Native(export)) => Ok(Arc::clone(export)),
+            Some(CapturePoint::KernelCow { .. }) => {
+                Err("ENOTSUP Kernel CoW RAM has no native file export".into())
+            }
+            None => Err("EIO capture is incomplete".into()),
+        }
+    }
+
+    /// The caller keeps the source held until the target acknowledges import.
+    /// Leaving the held phase invalidates this view of the live source RAM.
+    pub fn held_kernel_cow_cut(&self, arguments: &str) -> Result<(&RamLayout, &[u8]), String> {
+        let (token, fields) = Token::parse(arguments)?;
+        if !fields.is_empty() {
+            return Err("EINVAL trailing Kernel CoW cut arguments".into());
+        }
+        let capture = self
+            .capture_control
+            .capture
+            .as_ref()
+            .filter(|c| c.token == token)
+            .ok_or("ESTALE unknown capture session")?;
+        match capture.point.as_ref() {
+            Some(CapturePoint::KernelCow {
+                layout, checkpoint, ..
+            }) if capture.phase == Phase::Held => Ok((layout, checkpoint)),
+            _ => Err("EBUSY no Kernel CoW RAM at the held boundary".into()),
+        }
+    }
+
+    /// Confirm a successful import by the trusted target for this exact cut.
+    pub fn confirm_held_kernel_cow_import(&mut self, arguments: &str) -> Result<(), String> {
+        let (token, fields) = Token::parse(arguments)?;
+        if !fields.is_empty() {
+            return Err("EINVAL trailing Kernel CoW cut arguments".into());
+        }
+        let capture = self
+            .capture_control
+            .capture
+            .as_mut()
+            .filter(|c| c.token == token && c.phase == Phase::Held)
+            .ok_or("ESTALE no matching held Kernel CoW capture")?;
+        match capture.point.as_mut() {
+            Some(CapturePoint::KernelCow { imported, .. }) => {
+                *imported = true;
+                Ok(())
+            }
+            _ => Err("EINVAL capture used another RAM backend".into()),
+        }
     }
 }

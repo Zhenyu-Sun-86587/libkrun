@@ -636,12 +636,91 @@ pub struct RestoredMemory {
     pub cow_backing: Vec<Option<(std::fs::File, u64)>>,
 }
 
+#[derive(Clone, Copy)]
+enum BootMemory {
+    Native,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    KernelCowSource(crate::kernel_cow::KernelCow),
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    KernelCowTarget,
+}
+
 pub fn build_microvm(
     vm_resources: &super::resources::VmResources,
     event_manager: &mut EventManager,
     _shutdown_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
     restore: Option<RestoreCtx>,
+) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    build_microvm_with_memory(
+        vm_resources,
+        event_manager,
+        _shutdown_efd,
+        _sender,
+        restore,
+        BootMemory::Native,
+    )
+}
+
+/// Experimental source launch with fixed-address anonymous RAM. Production
+/// callers still need a held capture and an independently verified device cut.
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+pub fn build_kernel_cow_source(
+    vm_resources: &VmResources,
+    event_manager: &mut EventManager,
+    shutdown_efd: Option<EventFd>,
+    sender: Sender<WorkerMessage>,
+    kernel: crate::kernel_cow::KernelCow,
+) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    build_microvm_with_memory(
+        vm_resources,
+        event_manager,
+        shutdown_efd,
+        sender,
+        None,
+        BootMemory::KernelCowSource(kernel),
+    )
+}
+
+/// Restore in the same process which performed the authenticated import.
+/// RAM must fit the exact running profile; native file promotion is bypassed.
+/// The checkpoint must be from the very same held cut as the RAM.
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+pub fn build_kernel_cow_target(
+    vm_resources: &VmResources,
+    event_manager: &mut EventManager,
+    shutdown_efd: Option<EventFd>,
+    sender: Sender<WorkerMessage>,
+    ram: crate::kernel_cow::PreparedRam,
+    checkpoint: Vec<u8>,
+) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    let guest_memory = ram.into_memory();
+    let restore = RestoreCtx {
+        fork_backed_regions: vec![false; guest_memory.num_regions()],
+        guest_memory,
+        checkpoint,
+        demand_pager: None,
+        layered_ram: None,
+        cow_backing: Vec::new(),
+        portable_clock: true,
+    };
+    build_microvm_with_memory(
+        vm_resources,
+        event_manager,
+        shutdown_efd,
+        sender,
+        Some(restore),
+        BootMemory::KernelCowTarget,
+    )
+}
+
+fn build_microvm_with_memory(
+    vm_resources: &VmResources,
+    event_manager: &mut EventManager,
+    _shutdown_efd: Option<EventFd>,
+    _sender: Sender<WorkerMessage>,
+    restore: Option<RestoreCtx>,
+    memory_profile: BootMemory,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     let t_vmm = std::time::Instant::now();
     let vmm_timing_on = std::env::var("LIBKRUN_TIMING").is_ok();
@@ -817,8 +896,24 @@ pub fn build_microvm(
     } else {
         None
     };
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    if matches!(memory_profile, BootMemory::KernelCowTarget)
+        && restore_checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint.memory_growth.is_some() || checkpoint.cpu_growth.is_some()
+        })
+    {
+        return Err(StartMicrovmError::GuestMemoryMmap(
+            "Kernel CoW uses a fixed CPU and RAM topology".into(),
+        ));
+    }
     let (guest_memory, arch_memory_info, mut _shm_manager, payload_config) =
-        create_guest_memory(boot_memory_mib, vm_resources, &payload, restore_mem)?;
+        create_guest_memory_with_profile(
+            boot_memory_mib,
+            vm_resources,
+            &payload,
+            restore_mem,
+            memory_profile,
+        )?;
     vmm_timing!("memory created");
 
     #[cfg(all(
@@ -1654,6 +1749,13 @@ pub fn build_microvm(
             not(feature = "tee")
         ))]
         capture_control: Default::default(),
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            feature = "blk",
+            not(feature = "tee")
+        ))]
+        kernel_cow_ram: !matches!(memory_profile, BootMemory::Native),
 
         #[cfg(all(
             any(target_os = "linux", target_os = "macos"),
@@ -3018,6 +3120,29 @@ pub fn create_guest_memory(
     (GuestMemoryMmap, ArchMemoryInfo, ShmManager, PayloadConfig),
     StartMicrovmError,
 > {
+    create_guest_memory_with_profile(
+        mem_size,
+        vm_resources,
+        payload,
+        restore_mem,
+        BootMemory::Native,
+    )
+}
+
+fn create_guest_memory_with_profile(
+    mem_size: usize,
+    vm_resources: &VmResources,
+    payload: &Payload,
+    // Restore mode: when `Some`, use this guest memory (a CoW clone of a golden
+    // VM's RAM that already contains the running image) instead of allocating
+    // fresh, and SKIP loading the kernel/firmware/initrd. The same memory layout
+    // (config) must have produced it.
+    restore_mem: Option<RestoredMemory>,
+    _memory_profile: BootMemory,
+) -> std::result::Result<
+    (GuestMemoryMmap, ArchMemoryInfo, ShmManager, PayloadConfig),
+    StartMicrovmError,
+> {
     let mem_size = mem_size << 20;
 
     let (firmware_data, firmware_size) = if let Some(firmware) = &vm_resources.firmware_config {
@@ -3098,6 +3223,56 @@ pub fn create_guest_memory(
     // Add SHM regions before creating guest memory
     arch_mem_regions.extend(shm_manager.regions());
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    let kernel_cow_source = match _memory_profile {
+        BootMemory::Native => None,
+        mode => {
+            if !matches!(payload, Payload::ExternalKernel(_))
+                || use_vhost_user
+                || arch_mem_regions.len() != ram_region_count
+                || vm_resources.live_memory_growth
+                || vm_resources.live_cpu_growth
+            {
+                return Err(StartMicrovmError::GuestMemoryMmap(
+                    "Kernel CoW requires an external kernel, fixed CPU/RAM and no device SHM"
+                        .into(),
+                ));
+            }
+            let layout = crate::kernel_cow::RamLayout::new(&arch_mem_regions)
+                .map_err(|error| StartMicrovmError::GuestMemoryMmap(error.to_string()))?;
+            match mode {
+                BootMemory::KernelCowTarget => {
+                    let memory = restore_mem
+                        .filter(|restored| layout.matches(&restored.guest_memory))
+                        .ok_or_else(|| {
+                            StartMicrovmError::GuestMemoryMmap(
+                                "imported Kernel CoW RAM differs from the target layout".into(),
+                            )
+                        })?;
+                    return Ok((
+                        memory.guest_memory,
+                        arch_mem_info,
+                        shm_manager,
+                        PayloadConfig {
+                            entry_addr: GuestAddress(0),
+                            initrd_config: None,
+                            kernel_cmdline: None,
+                            pvh: false,
+                        },
+                    ));
+                }
+                BootMemory::KernelCowSource(kernel) => Some(
+                    kernel
+                        .allocate(&layout)
+                        .map_err(|error| StartMicrovmError::GuestMemoryMmap(error.to_string()))?,
+                ),
+                BootMemory::Native => unreachable!(),
+            }
+        }
+    };
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))))]
+    let kernel_cow_source: Option<GuestMemoryMmap> = None;
+
     // Restore: the provided CoW-clone memory already holds the running image —
     // skip allocation + payload load entirely.
     if let Some(restored) = restore_mem {
@@ -3171,7 +3346,9 @@ pub fn create_guest_memory(
         return Ok((guest_mem, arch_mem_info, shm_manager, payload_config));
     }
 
-    let guest_mem = if use_vhost_user {
+    let guest_mem = if let Some(memory) = kernel_cow_source {
+        memory
+    } else if use_vhost_user {
         #[cfg(all(feature = "vhost-user", target_os = "linux"))]
         {
             debug!(

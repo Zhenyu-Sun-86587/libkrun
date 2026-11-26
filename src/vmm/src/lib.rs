@@ -20,6 +20,8 @@ pub mod builder;
 /// Checkpointed CPU discovery policy and live creation bookkeeping.
 pub mod cpu_growth;
 mod host_network;
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+pub mod kernel_cow;
 pub use host_network::ABI_VERSION as HOST_NETWORK_ABI_VERSION;
 #[cfg(all(
     target_os = "linux",
@@ -514,6 +516,13 @@ pub struct Vmm {
         not(feature = "tee")
     ))]
     capture_control: capture_txn::CaptureControl,
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    kernel_cow_ram: bool,
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     guest_gate: Option<Arc<Mutex<devices::virtio::guest_gate::GuestGate>>>,
     // Guest VM core resources.
@@ -710,6 +719,8 @@ fn paused_vm_with_failed_ram_mapping_cannot_capture_or_rearm() {
     let mut vmm = Vmm {
         #[cfg(feature = "blk")]
         capture_control: Default::default(),
+        #[cfg(feature = "blk")]
+        kernel_cow_ram: false,
         guest_gate: None,
         prototype_memory: None,
         memory_growth_topology: None,
