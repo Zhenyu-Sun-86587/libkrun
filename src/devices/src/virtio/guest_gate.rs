@@ -12,6 +12,8 @@ pub use target::{ParkedState, ParkedUplink, TargetScope};
 pub const DEVICE_TYPE: u32 = 0xff51;
 const COMMAND_BYTES: usize = 36;
 const RESPONSE_BYTES: usize = 28;
+const STOP_BARRIER_FEATURE: u64 = 1;
+const PARK_STOP: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -23,6 +25,7 @@ enum Phase {
     FailedHeld,
     Parking,
     Parked,
+    StopParked,
     Releasing,
     Aborting,
     Released,
@@ -50,6 +53,7 @@ impl Phase {
             Self::FailedHeld => "failed_held",
             Self::Parking => "parking",
             Self::Parked => "parked",
+            Self::StopParked => "stop_parked",
             Self::Releasing => "releasing",
             Self::Aborting => "aborting",
             Self::Released => "released",
@@ -126,6 +130,16 @@ impl GuestGate {
         self.session
             .as_ref()
             .is_some_and(|s| s.phase == Phase::Parked && s.number == number && s.nonce == nonce)
+    }
+
+    pub fn stop_supported(&self) -> bool {
+        self.features & STOP_BARRIER_FEATURE != 0
+    }
+
+    pub fn stop_parked(&self, number: u32, nonce: u128) -> bool {
+        self.session.as_ref().is_some_and(|s| {
+            s.phase == Phase::StopParked && s.number == number && s.nonce == nonce
+        })
     }
 
     pub fn source_released(&self, number: u32, nonce: u128) -> bool {
@@ -239,7 +253,14 @@ impl GuestGate {
             }
         } else {
             let request_network = verb == "GUEST_GATE_PARK_NETWORK";
-            let anchor = if request_network || verb == "GUEST_GATE_PARK" {
+            let park = match verb {
+                "GUEST_GATE_PARK" => Some(5),
+                "GUEST_GATE_PARK_NETWORK" => Some(8),
+                "GUEST_GATE_PARK_STOP" if self.stop_supported() => Some(PARK_STOP),
+                "GUEST_GATE_PARK_STOP" => return Err("ENOTSUP Guest kernel did not negotiate the stop barrier"),
+                _ => None,
+            };
+            let anchor = if park.is_some() {
                 let value = fields
                     .next()
                     .filter(|v| v.len() == 32 && v.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -261,29 +282,30 @@ impl GuestGate {
                 .as_mut()
                 .filter(|s| s.number == number && s.nonce == nonce)
                 .ok_or("ESTALE unknown gate session")?;
-            match (verb, s.phase) {
-                ("GUEST_GATE_QUERY", _) => (),
-                ("GUEST_GATE_PARK" | "GUEST_GATE_PARK_NETWORK", Phase::Armed) => {
+            match (park, verb, s.phase) {
+                (_, "GUEST_GATE_QUERY", _) => (),
+                (Some(opcode), _, Phase::Armed) => {
                     self.network_park = request_network;
                     self.anchor = anchor.unwrap();
                     s.phase = Phase::Parking;
-                    self.publish(if request_network { 8 } else { 5 });
+                    self.publish(opcode);
                 }
-                ("GUEST_GATE_PARK" | "GUEST_GATE_PARK_NETWORK", Phase::Parking | Phase::Parked)
-                    if Some(self.anchor) == anchor && self.network_park == request_network =>
+                (Some(opcode), _, Phase::Parking | Phase::Parked | Phase::StopParked)
+                    if Some(self.anchor) == anchor
+                        && u32::from_le_bytes(self.command[8..12].try_into().unwrap()) == opcode =>
                 {
                     ()
                 }
-                ("GUEST_GATE_RELEASE", Phase::Armed | Phase::Parked) => {
+                (_, "GUEST_GATE_RELEASE", Phase::Armed | Phase::Parked | Phase::StopParked) => {
                     s.phase = Phase::Releasing;
                     self.publish(2);
                 }
-                ("GUEST_GATE_RELEASE", Phase::Releasing | Phase::Released) => (),
-                ("GUEST_GATE_ABORT", Phase::Preparing | Phase::Armed | Phase::Parked) => {
+                (_, "GUEST_GATE_RELEASE", Phase::Releasing | Phase::Released) => (),
+                (_, "GUEST_GATE_ABORT", Phase::Preparing | Phase::Armed | Phase::Parked | Phase::StopParked) => {
                     s.phase = Phase::Aborting;
                     self.publish(3);
                 }
-                ("GUEST_GATE_ABORT", Phase::Aborting | Phase::Aborted) => (),
+                (_, "GUEST_GATE_ABORT", Phase::Aborting | Phase::Aborted) => (),
                 _ => return Err("EINVAL gate decision conflicts with current phase"),
             }
         }
@@ -308,10 +330,12 @@ impl GuestGate {
         }
         let error = i32::from_le_bytes(self.response[20..24].try_into().unwrap());
         let status = u32::from_le_bytes(self.response[24..28].try_into().unwrap());
+        let command = u32::from_le_bytes(self.command[8..12].try_into().unwrap());
         let next = match (s.phase, status, error) {
             (Phase::Preparing, 1, 0) => Phase::Armed,
-            (Phase::Parking, 6, 0) if !self.network_park => Phase::Parked,
+            (Phase::Parking, 6, 0) if command == 5 => Phase::Parked,
             (Phase::Parking, 9, 0) if self.network_park => Phase::Parked,
+            (Phase::Parking, 10, 0) if command == PARK_STOP => Phase::StopParked,
             (Phase::Applying, 7, 0) => Phase::IdentityReady,
             (Phase::Applying | Phase::Activating, 8, e) if e < 0 => Phase::FailedHeld,
             (Phase::Activating, 2, 0) => Phase::Released,
@@ -350,7 +374,7 @@ impl GuestGate {
 
 impl VirtioDevice for GuestGate {
     fn avail_features(&self) -> u64 {
-        1 << 32
+        (1 << 32) | STOP_BARRIER_FEATURE
     }
     fn acked_features(&self) -> u64 {
         self.features

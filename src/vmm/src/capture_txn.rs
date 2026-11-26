@@ -177,7 +177,7 @@ impl Vmm {
     }
 
     pub fn deep_virtio_inventory(&self) -> Result<String, String> {
-        let (gate_session, gate_phase, measured, quarantined) = {
+        let (gate_session, gate_phase, measured, quarantined, stop_supported) = {
             let gate = self
                 .guest_gate
                 .as_ref()
@@ -185,7 +185,7 @@ impl Vmm {
                 .lock()
                 .unwrap();
             let (session, phase, measured) = gate.source_status();
-            (session, phase, measured, gate.target_quarantined())
+            (session, phase, measured, gate.target_quarantined(), gate.stop_supported())
         };
         let capture = self.capture_control.capture.as_ref();
         let standby = self.capture_control.standby.as_ref();
@@ -210,7 +210,7 @@ impl Vmm {
                     "RUNNING"
                 }
                 (VmmRunState::Running, _)
-                    if matches!(gate_phase, "armed" | "parking" | "parked") =>
+                    if matches!(gate_phase, "armed" | "parking" | "parked" | "stop_parked") =>
                 {
                     "GUEST_HELD"
                 }
@@ -222,7 +222,8 @@ impl Vmm {
         Ok(format!(
             "OK {}\n",
             serde_json::json!({"protocol":"CaptureControl/1","devices":inventory,"source_disposition":disposition,
-                "last_session":last_session, "guest_gate":gate_phase, "measured_helper":measured,"standby_blocker":standby_blocker})
+                "last_session":last_session, "guest_gate":gate_phase, "measured_helper":measured,"standby_blocker":standby_blocker,
+                "stop_barrier":stop_supported})
         ))
     }
 
@@ -290,7 +291,7 @@ impl Vmm {
                 let permitted = {
                     let gate = self.guest_gate.as_ref().unwrap().lock().unwrap();
                     if managed {
-                        gate.parked(sequence, nonce)
+                        gate.parked(sequence, nonce) || gate.stop_parked(sequence, nonce)
                     } else {
                         gate.allows_raw_standby()
                     }

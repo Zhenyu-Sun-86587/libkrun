@@ -2249,7 +2249,8 @@ fn handle_control_stream(
                 | "GUEST_GATE_RELEASE"
                 | "GUEST_GATE_ABORT"
                 | "GUEST_GATE_PARK"
-                | "GUEST_GATE_PARK_NETWORK" => vmm
+                | "GUEST_GATE_PARK_NETWORK"
+                | "GUEST_GATE_PARK_STOP" => vmm
                     .lock()
                     .unwrap()
                     .guest_gate_control(&verb, _arg)
