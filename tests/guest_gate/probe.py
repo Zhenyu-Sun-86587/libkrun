@@ -1,6 +1,7 @@
 """Boot a two-vCPU Guest and check the host-controlled source freezer on KVM."""
 import argparse
 import array
+import errno
 import fcntl
 import ctypes
 import hashlib
@@ -88,7 +89,7 @@ def receive_capture(address, session):
         return output, hashlib.sha256(state).digest(), hashlib.sha256(descriptor).digest(), seen
 
 
-def test(library, executable, standby, helper, wrong_digest, capture):
+def test(library, executable, standby, helper, wrong_digest, capture, helper_exits):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp, "root")
         root.mkdir()
@@ -148,6 +149,24 @@ def test(library, executable, standby, helper, wrong_digest, capture):
 
         try:
             wait_for(lambda: min(counts()) >= 2, 30)
+            if helper_exits:
+                for number in (1, 2):
+                    session = f"{number} {secrets.token_hex(16)}"
+                    start = time.monotonic()
+                    assert command("PREPARE", session, "1000 5000") == f"OK {session} preparing 0"
+                    phase(session, "armed")
+                    armed = time.monotonic()
+                    fixed = counts()
+                    time.sleep(0.16)
+                    assert counts() == fixed, "ordinary or nested PID namespace counter advanced"
+                    phase(session, "failed_thawed", -errno.EPIPE)
+                    wait_for(lambda: all(b > a for a, b in zip(fixed, counts())), 2)
+                    thawed = time.monotonic()
+                    assert thawed - armed < 3, "a dead helper outlived its bounded armed interval"
+                    print(f"session={number} helper SIGKILL: frozen {len(fixed)} counters across 2 vCPUs, "
+                          f"arm_ms={(armed-start)*1000:.1f} arm_to_counter_resume_ms={(thawed-armed)*1000:.1f}, "
+                          "kernel reported failed_thawed EPIPE", flush=True)
+                return
             if wrong_digest:
                 session = f"1 {secrets.token_hex(16)}"
                 assert command("PREPARE", session, "1000 2500").startswith("OK")
@@ -278,12 +297,15 @@ if __name__ == "__main__":
     parser.add_argument("--standby", action="store_true", help="exercise raw standby with two test disks")
     parser.add_argument("--capture", action="store_true", help="also export held vCPU/device state and sealed RAM")
     parser.add_argument("--identity-helper", type=Path, help="pin the actual static helper executable")
-    parser.add_argument("--wrong-digest", action="store_true", help="require pre-freeze measurement rejection")
+    failures = parser.add_mutually_exclusive_group()
+    failures.add_argument("--wrong-digest", action="store_true", help="require pre-freeze measurement rejection")
+    failures.add_argument("--helper-exits", action="store_true", help="require thaw when the measured test helper dies after arming")
     parser.add_argument("--expected-helper", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.wrong_digest and not args.identity_helper:
-        parser.error("--wrong-digest requires --identity-helper")
+    if (args.wrong_digest or args.helper_exits) and not args.identity_helper:
+        parser.error("the measured helper failure cases require --identity-helper")
     if args.guest:
         guest(args.libkrun.resolve(), args.guest_path, args.guest, args.standby, args.expected_helper)
     else:
-        test(args.libkrun.resolve(), args.guest_path.resolve(), args.standby or args.capture, args.identity_helper, args.wrong_digest, args.capture)
+        test(args.libkrun.resolve(), args.guest_path.resolve(), args.standby or args.capture,
+             args.identity_helper, args.wrong_digest, args.capture, args.helper_exits)
