@@ -662,8 +662,7 @@ pub fn build_microvm(
     )
 }
 
-/// Experimental source launch with fixed-address anonymous RAM. Production
-/// callers still need a held capture and an independently verified device cut.
+/// Launch a held-capture source with fixed-address anonymous RAM.
 #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
 pub fn build_kernel_cow_source(
     vm_resources: &VmResources,
@@ -2412,6 +2411,7 @@ fn load_payload(
     guest_mem: GuestMemoryMmap,
     _arch_mem_info: &ArchMemoryInfo,
     payload: &Payload,
+    _memory_profile: BootMemory,
 ) -> std::result::Result<LoadedPayload, StartMicrovmError> {
     let host_network = _vm_resources
         .vsock
@@ -2477,6 +2477,24 @@ fn load_payload(
                 } else {
                     return Err(StartMicrovmError::MissingKernelConfig);
                 };
+
+            #[cfg(target_os = "linux")]
+            if matches!(_memory_profile, BootMemory::KernelCowSource(_)) {
+                // The fixed layout already owns the normal kernel slot. Load
+                // the bundled image without replacing that anonymous mapping.
+                let image =
+                    unsafe { std::slice::from_raw_parts(kernel_host_addr as *const u8, kernel_size) };
+                guest_mem
+                    .write_slice(image, GuestAddress(kernel_guest_addr))
+                    .map_err(|error| StartMicrovmError::GuestMemoryMmap(error.to_string()))?;
+                return Ok(LoadedPayload {
+                    guest_mem,
+                    entry_addr: GuestAddress(kernel_entry_addr),
+                    initrd_config: None,
+                    kernel_cmdline: None,
+                    pvh: false,
+                });
+            }
 
             #[cfg(all(feature = "vhost-user", target_os = "linux"))]
             let use_vhost_user = !_vm_resources.vhost_user_devices.is_empty();
@@ -3163,7 +3181,15 @@ fn create_guest_memory_with_profile(
                 } else {
                     return Err(StartMicrovmError::MissingKernelConfig);
                 };
-            arch::arch_memory_regions(mem_size, Some(kernel_guest_addr), kernel_size, 0, None)
+            let (info, mut regions) =
+                arch::arch_memory_regions(mem_size, Some(kernel_guest_addr), kernel_size, 0, None);
+            if cfg!(target_os = "linux") && !matches!(_memory_profile, BootMemory::Native) {
+                // Keep the same complete GPA geometry as a normal bundled
+                // kernel boot so the ordinary durable StatePoint reader can
+                // restore it on a Worker without the CoW syscall.
+                regions.insert(1, (GuestAddress(kernel_guest_addr), kernel_size));
+            }
+            (info, regions)
         }
         Payload::ExternalKernel(external_kernel) => arch::arch_memory_regions(
             mem_size,
@@ -3227,14 +3253,14 @@ fn create_guest_memory_with_profile(
     let kernel_cow_source = match _memory_profile {
         BootMemory::Native => None,
         mode => {
-            if !matches!(payload, Payload::ExternalKernel(_))
+            if !matches!(payload, Payload::ExternalKernel(_) | Payload::KernelMmap)
                 || use_vhost_user
                 || arch_mem_regions.len() != ram_region_count
                 || vm_resources.live_memory_growth
                 || vm_resources.live_cpu_growth
             {
                 return Err(StartMicrovmError::GuestMemoryMmap(
-                    "Kernel CoW requires an external kernel, fixed CPU/RAM and no device SHM"
+                    "Kernel CoW requires a direct kernel boot, fixed CPU/RAM and no device SHM"
                         .into(),
                 ));
             }
@@ -3431,7 +3457,7 @@ fn create_guest_memory_with_profile(
         initrd_config,
         kernel_cmdline: cmdline,
         pvh,
-    } = load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;
+    } = load_payload(vm_resources, guest_mem, &arch_mem_info, payload, _memory_profile)?;
 
     // Only write firmware if data exists AND this isn't an ExternalKernel payload
     // (ExternalKernel does direct kernel boot and doesn't use EFI firmware)

@@ -219,12 +219,15 @@ impl Vmm {
         };
         let inventory = self.mmio_device_manager.capture_inventory()?;
         let standby_blocker = self.standby_profile(&inventory).err();
-        Ok(format!(
-            "OK {}\n",
-            serde_json::json!({"protocol":"CaptureControl/1","devices":inventory,"source_disposition":disposition,
-                "last_session":last_session, "guest_gate":gate_phase, "measured_helper":measured,"standby_blocker":standby_blocker,
-                "stop_barrier":stop_supported})
-        ))
+        let mut reply = serde_json::json!({"protocol":"CaptureControl/1","devices":inventory,"source_disposition":disposition,
+            "last_session":last_session, "guest_gate":gate_phase, "measured_helper":measured,"standby_blocker":standby_blocker,
+            "stop_barrier":stop_supported});
+        if self.kernel_cow_ram
+            && crate::kernel_cow::RamLayout::from_fixed_memory(&self.guest_memory).is_ok()
+        {
+            reply["memory_fork_profile"] = crate::kernel_cow::RAM_PROFILE.into();
+        }
+        Ok(format!("OK {reply}\n"))
     }
 
     pub fn standby_control(&mut self, verb: &str, arguments: &str) -> Result<String, String> {

@@ -50,6 +50,7 @@ timeout -k 5 "${BOOT_TIMEOUT:-120}" "$qemu" -no-user-config -machine pc,accel=kv
     -append 'console=ttyS0,115200 panic=-1 oops=panic panic_on_warn=1' >"$log" 2>&1
 tr -d '\r' <"$log" >"$stage/serial.log"
 if ! grep -q '^libkrun Worker CoW: ' "$stage/serial.log" ||
+   ! grep -q '^libkrun RO anchor: ' "$stage/serial.log" ||
    ! grep -q '^libkrun held CoW VMM: ' "$stage/serial.log" ||
    ! grep -qx 'SMOLVM_COW_WORKER_TAINTED=0' "$stage/serial.log" ||
    ! grep -qx 'SMOLVM_COW_WORKER_RESULT=0' "$stage/serial.log"; then

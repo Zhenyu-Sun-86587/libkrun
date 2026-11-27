@@ -2157,6 +2157,7 @@ fn handle_control_stream(
                         | "CAPTURE_KERNEL_PREPARE"
                         | "CAPTURE_KERNEL_EXPORT"
                         | "CAPTURE_KERNEL_IMPORTED"
+                        | "CAPTURE_KERNEL_ABANDON"
                         | "CAPTURE_RECOVER_FDS"
                         | "CAPTURE_FINISH"
                         | "CAPTURE_CANCEL"
@@ -2278,9 +2279,14 @@ fn handle_control_stream(
                     feature = "blk",
                     not(feature = "tee")
                 ))]
-                "CAPTURE_KERNEL_IMPORTED" => {
+                "CAPTURE_KERNEL_IMPORTED" | "CAPTURE_KERNEL_ABANDON" => {
                     let mut vmm = vmm.lock().unwrap();
-                    vmm.confirm_held_kernel_cow_import(_arg)
+                    let result = if verb == "CAPTURE_KERNEL_IMPORTED" {
+                        vmm.confirm_held_kernel_cow_import(_arg)
+                    } else {
+                        vmm.abandon_held_kernel_cow(_arg)
+                    };
+                    result
                         .and_then(|()| vmm.held_capture_control("CAPTURE_QUERY", _arg))
                         .unwrap_or_else(|e| format!("ERR {e}\n"))
                 }

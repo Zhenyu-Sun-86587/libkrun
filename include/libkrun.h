@@ -1352,13 +1352,20 @@ struct krun_worker_cow_range_v1 {
     uint64_t guest_start;
     uint64_t size;
 };
+/* Detect the versioned Worker kernel ABI before installing seccomp. */
+int32_t krun_probe_worker_kernel_cow_v1(void);
+
+/* Select fixed anonymous RAM for this managed source. Call in the final VMM
+ * process before other sandbox setup. On success the process may no longer
+ * use the CoW syscall. Abort launch on any error. */
 int32_t krun_enable_worker_kernel_cow_v1(uint32_t ctx_id);
 
 /* Takes ownership of donor_pidfd even on error. The trusted supervisor must
  * keep the authorized source held and match these ranges and checkpoint to
  * that source incarnation. Call in the final single-threaded target process
  * before seccomp. On success the process is permanently using uid/gid, with
- * only the optional kvm_group (0 for none). Abort launch on any error.
+ * only the optional kvm_group (0 for none), and cannot use the CoW syscall
+ * again. Abort launch on any error.
  * The context still requires the parked target authority and writer set. */
 int32_t krun_import_worker_kernel_cow_v1(uint32_t ctx_id,
                                         int32_t donor_pidfd,
@@ -1367,6 +1374,19 @@ int32_t krun_import_worker_kernel_cow_v1(uint32_t ctx_id,
                                         const uint8_t *checkpoint,
                                         size_t checkpoint_len,
                                         uint32_t uid, uint32_t gid, uint32_t kvm_group);
+
+/* As above, taking ownership of donor_pidfd. Import one held cut as read-only
+ * RAM in this dedicated final helper process and permanently switch to uid/gid
+ * without supplemental groups. The caller must restrict memory-management
+ * syscalls before serving requests and keep this library loaded. */
+int32_t krun_import_worker_kernel_cow_anchor_v1(int32_t donor_pidfd,
+                                               const struct krun_worker_cow_range_v1 *ranges,
+                                               size_t range_count,
+                                               uint32_t uid, uint32_t gid);
+
+/* Borrow the writable fd and stream packed RAM in region order. Any error
+ * means the transfer may be partial and the receiver must discard it. */
+int32_t krun_write_worker_kernel_cow_anchor_v1(int32_t fd);
 #endif
 #endif
 

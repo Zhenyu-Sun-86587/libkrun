@@ -12,7 +12,9 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 
 use vm_memory::mmap::{GuestRegionMmap, MmapRegion};
-use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{
+    Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress,
+};
 
 const ABI_MARKER: &str = "/sys/kernel/smolvm_cow/abi";
 const ABI_ID: &str = "smolvm_cow_v1";
@@ -25,6 +27,7 @@ const HOST_BASE: usize = 0x4000_0000_0000;
 const HOST_LIMIT: usize = 0x4800_0000_0000;
 pub const MAX_RAM_REGIONS: usize = 64;
 pub const MAX_CHECKPOINT_BYTES: usize = 64 << 20;
+pub const RAM_PROFILE: &str = "kernel_cow_anon_v1";
 const RAM_PROT: libc::c_int = libc::PROT_READ | libc::PROT_WRITE;
 const RAM_FLAGS: libc::c_int = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
 
@@ -127,6 +130,16 @@ impl KernelCow {
         donor: BorrowedFd<'_>,
         layout: &RamLayout,
     ) -> io::Result<PreparedRam> {
+        // SAFETY: the caller has authenticated the exact held donor.
+        unsafe { self.import_memory(donor, layout, RAM_PROT) }.map(PreparedRam)
+    }
+
+    unsafe fn import_memory(
+        &self,
+        donor: BorrowedFd<'_>,
+        layout: &RamLayout,
+        protection: libc::c_int,
+    ) -> io::Result<GuestMemoryMmap> {
         assemble(layout, |range| {
             let mut mapping = Mapping::reserve(range, libc::PROT_NONE)?;
             let request = Import {
@@ -141,12 +154,65 @@ impl KernelCow {
             let status =
                 unsafe { libc::syscall(self.0, IMPORT, &raw const request, size_of::<Import>()) };
             syscall_result(status)?;
-            // The source may be a read-only anchor. Restore write permission
-            // through Linux's normal protections so its CoW PTEs stay intact.
-            mapping.set_protection(RAM_PROT)?;
+            // Set the final protections through the normal VM path so the
+            // imported CoW PTEs stay intact, including for an RO donor.
+            mapping.set_protection(protection)?;
             Ok(mapping)
         })
-        .map(PreparedRam)
+    }
+
+    /// Permanently deny this discovered CoW syscall throughout this process.
+    /// Call before installing the rest of the Worker sandbox.
+    pub fn prohibit_import(self) -> io::Result<()> {
+        const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+        let instruction = |code: u32, jf, k| libc::sock_filter {
+            code: code as u16,
+            jt: 0,
+            jf,
+            k,
+        };
+        let filter = [
+            instruction(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0, 0),
+            instruction(
+                libc::BPF_ALU | libc::BPF_AND | libc::BPF_K,
+                0,
+                !X32_SYSCALL_BIT,
+            ),
+            instruction(
+                libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+                1,
+                self.0 as u32,
+            ),
+            instruction(
+                libc::BPF_RET | libc::BPF_K,
+                0,
+                libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            ),
+            instruction(libc::BPF_RET | libc::BPF_K, 0, libc::SECCOMP_RET_ALLOW),
+        ];
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr().cast_mut(),
+        };
+        // SAFETY: no_new_privs is a scalar, irreversible restriction. The
+        // seccomp filter reads the bounded instruction array during the call.
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        match unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                libc::SECCOMP_SET_MODE_FILTER,
+                libc::SECCOMP_FILTER_FLAG_TSYNC,
+                &raw const program,
+            )
+        } {
+            0 => Ok(()),
+            -1 => Err(io::Error::last_os_error()),
+            _ => Err(io::Error::other(
+                "Worker CoW seccomp could not synchronize all threads",
+            )),
+        }
     }
 }
 
@@ -161,6 +227,45 @@ impl PreparedRam {
 
     pub(crate) fn into_memory(self) -> GuestMemoryMmap {
         self.0
+    }
+}
+
+/// The RAM of one immutable capture mapped read-only in a dedicated helper.
+/// It contains no live device or KVM state.
+pub struct ReadOnlyAnchor(GuestMemoryMmap);
+
+impl ReadOnlyAnchor {
+    /// Stream exactly the packed region bytes without exposing any writable
+    /// memory handle. An export is independent of the original source's mm.
+    pub fn write_to(&self, output: BorrowedFd<'_>) -> io::Result<()> {
+        for region in self.0.iter() {
+            let host = region
+                .get_host_address(MemoryRegionAddress(0))
+                .map_err(io::Error::other)?;
+            // SAFETY: this helper owns a live, read-only anonymous mapping
+            // of the entire region, with no mutable aliases in this mm.
+            let bytes = unsafe { std::slice::from_raw_parts(host, region.len() as usize) };
+            for mut chunk in bytes.chunks(1 << 20) {
+                while !chunk.is_empty() {
+                    // SAFETY: output is borrowed and chunk is readable for its length.
+                    let written = unsafe {
+                        libc::write(output.as_raw_fd(), chunk.as_ptr().cast(), chunk.len())
+                    };
+                    if written < 0 {
+                        let error = io::Error::last_os_error();
+                        if error.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    if written == 0 {
+                        return Err(io::ErrorKind::WriteZero.into());
+                    }
+                    chunk = &chunk[written as usize..];
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -180,6 +285,36 @@ pub unsafe fn import_for_worker(
     target_gid: libc::gid_t,
     kvm_group: Option<libc::gid_t>,
 ) -> io::Result<PreparedRam> {
+    // SAFETY: the caller proves the exact held donor and bootstrap scope.
+    unsafe { import_and_drop(donor, layout, target_uid, target_gid, kvm_group, RAM_PROT) }
+        .map(PreparedRam)
+}
+
+/// Import the held cut into the final anchor process and expose its RAM read-only.
+///
+/// # Safety
+/// The requirements of [`import_for_worker`] apply, including terminating the
+/// bootstrap on failure. Callers must additionally sandbox the dedicated anchor
+/// against changing its memory mappings before serving any requests.
+pub unsafe fn import_anchor_for_worker(
+    donor: OwnedFd,
+    layout: &RamLayout,
+    anchor_uid: libc::uid_t,
+    anchor_gid: libc::gid_t,
+) -> io::Result<ReadOnlyAnchor> {
+    // SAFETY: the caller proves the exact held donor and bootstrap scope.
+    unsafe { import_and_drop(donor, layout, anchor_uid, anchor_gid, None, libc::PROT_READ) }
+        .map(ReadOnlyAnchor)
+}
+
+unsafe fn import_and_drop(
+    donor: OwnedFd,
+    layout: &RamLayout,
+    target_uid: libc::uid_t,
+    target_gid: libc::gid_t,
+    kvm_group: Option<libc::gid_t>,
+    protection: libc::c_int,
+) -> io::Result<GuestMemoryMmap> {
     if target_uid == 0 || target_gid == 0 || kvm_group == Some(0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -202,12 +337,15 @@ pub unsafe fn import_for_worker(
     set_worker_capabilities(PTRACE, PTRACE | SET_IDS)?;
     let prepared = KernelCow::probe().and_then(|kernel| {
         // SAFETY: the caller is responsible for authentication and the held cut.
-        unsafe { kernel.import_held(donor.as_fd(), layout) }
+        unsafe { kernel.import_memory(donor.as_fd(), layout, protection) }
+            .map(|memory| (kernel, memory))
     });
     drop(donor);
     set_worker_capabilities(SET_IDS, SET_IDS)?;
     drop_worker_credentials(target_uid, target_gid, kvm_group)?;
-    prepared
+    let (kernel, memory) = prepared?;
+    kernel.prohibit_import()?;
+    Ok(memory)
 }
 
 #[repr(C)]
@@ -269,6 +407,7 @@ fn drop_worker_credentials(
             || libc::setgroups(groups.len(), groups.as_ptr()) != 0
             || libc::setresgid(gid, gid, gid) != 0
             || libc::setresuid(uid, uid, uid) != 0
+            || libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0
     } {
         return Err(io::Error::last_os_error());
     }
@@ -432,6 +571,7 @@ fn assemble(
 struct Mapping {
     pointer: *mut libc::c_void,
     length: usize,
+    protection: libc::c_int,
 }
 
 impl Mapping {
@@ -454,6 +594,7 @@ impl Mapping {
         let mapping = Self {
             pointer,
             length: range.length,
+            protection,
         };
         if pointer as usize != range.host {
             return Err(unsupported("the Worker did not honor MAP_FIXED_NOREPLACE"));
@@ -470,6 +611,7 @@ impl Mapping {
         if unsafe { libc::mprotect(self.pointer, self.length, protection) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        self.protection = protection;
         Ok(())
     }
 
@@ -477,7 +619,12 @@ impl Mapping {
         // SAFETY: the mapping is live and self is the only owner. On success
         // MmapRegion assumes that ownership. On error self still unmaps it.
         let region = unsafe {
-            MmapRegion::build_raw_owned(self.pointer.cast(), self.length, RAM_PROT, RAM_FLAGS)
+            MmapRegion::build_raw_owned(
+                self.pointer.cast(),
+                self.length,
+                self.protection,
+                RAM_FLAGS,
+            )
         }
         .map_err(io::Error::other)?;
         std::mem::forget(self);
@@ -495,6 +642,7 @@ impl Drop for Mapping {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::FileExt;
 
     #[test]
     fn marker_requires_exact_layout_before_using_discovered_number() {
@@ -529,5 +677,34 @@ mod tests {
         );
         let again = Mapping::reserve(layout.0[0], RAM_PROT).unwrap();
         drop((again, occupied));
+    }
+
+    #[test]
+    fn anchor_export_packs_only_guest_regions_in_order() {
+        let layout = RamLayout::new(&[
+            (GuestAddress(0x0400_0000), PAGE),
+            (GuestAddress(0x2000_0000), PAGE),
+        ])
+        .unwrap();
+        let memory = assemble(&layout, |range| {
+            let mut mapping = Mapping::reserve(range, RAM_PROT)?;
+            let byte = if range.guest.raw_value() == 0x0400_0000 {
+                0x31
+            } else {
+                0x53
+            };
+            // SAFETY: the new mapping covers this entire page and is writable.
+            unsafe { mapping.pointer.cast::<u8>().write_bytes(byte, PAGE) };
+            mapping.set_protection(libc::PROT_READ)?;
+            Ok(mapping)
+        })
+        .unwrap();
+        let output = tempfile::tempfile().unwrap();
+        ReadOnlyAnchor(memory).write_to(output.as_fd()).unwrap();
+        assert_eq!(output.metadata().unwrap().len(), (2 * PAGE) as u64);
+        let mut actual = [0; 2 * PAGE];
+        output.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(actual[..PAGE], [0x31; PAGE]);
+        assert_eq!(actual[PAGE..], [0x53; PAGE]);
     }
 }

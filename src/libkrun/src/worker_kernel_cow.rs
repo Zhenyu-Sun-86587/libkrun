@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 use super::{CTX_MAP, ContextConfig, clear_last_error, set_last_error, worker_pivot};
 use std::io;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
+use std::slice;
+use std::sync::Mutex;
 use vm_memory::GuestAddress;
 use vmm::kernel_cow::{
-    KernelCow, MAX_CHECKPOINT_BYTES, MAX_RAM_REGIONS, PreparedRam, RamLayout, import_for_worker,
+    KernelCow, MAX_CHECKPOINT_BYTES, MAX_RAM_REGIONS, PreparedRam, RamLayout, ReadOnlyAnchor,
+    import_anchor_for_worker, import_for_worker,
 };
 
 pub(super) enum Boot {
@@ -21,14 +24,22 @@ pub struct KrunWorkerCowRangeV1 {
     size: u64,
 }
 
+static ANCHOR: Mutex<Option<ReadOnlyAnchor>> = Mutex::new(None);
+
 fn set_io_error(error: io::Error) -> i32 {
     let code = error.raw_os_error().unwrap_or_else(|| match error.kind() {
         io::ErrorKind::Unsupported => libc::EOPNOTSUPP,
         io::ErrorKind::InvalidInput => libc::EINVAL,
         _ => libc::EIO,
     });
-    set_last_error(format!("prepare Worker kernel CoW: {error}"));
+    set_last_error(format!("Worker kernel CoW: {error}"));
     -code
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn krun_probe_worker_kernel_cow_v1() -> i32 {
+    clear_last_error();
+    KernelCow::probe().map_or_else(set_io_error, |_| 0)
 }
 
 #[unsafe(no_mangle)]
@@ -43,11 +54,30 @@ pub extern "C" fn krun_enable_worker_kernel_cow_v1(ctx_id: u32) -> i32 {
     }
     match KernelCow::probe() {
         Ok(kernel) => {
+            if let Err(error) = kernel.prohibit_import() {
+                return set_io_error(error);
+            }
             ctx.worker_kernel_cow = Some(Boot::Source(kernel));
             0
         }
         Err(error) => set_io_error(error),
     }
+}
+
+/// The caller supplies a readable `range_count`-element array for this call.
+unsafe fn worker_layout(
+    ranges: *const KrunWorkerCowRangeV1,
+    range_count: usize,
+) -> Result<RamLayout, i32> {
+    if ranges.is_null() || !ranges.is_aligned() || !(1..=MAX_RAM_REGIONS).contains(&range_count) {
+        return Err(-libc::EINVAL);
+    }
+    // SAFETY: caller supplies the bounded input array.
+    let ranges = unsafe { slice::from_raw_parts(ranges, range_count) }
+        .iter()
+        .map(|range| (GuestAddress(range.guest_start), range.size as usize))
+        .collect::<Vec<_>>();
+    RamLayout::new(&ranges).map_err(set_io_error)
 }
 
 /// Consume an authenticated source and prepare RAM before creating any VMM
@@ -77,12 +107,7 @@ pub unsafe extern "C" fn krun_import_worker_kernel_cow_v1(
     }
     // SAFETY: ownership transfers at entry, including when validation fails.
     let donor = unsafe { OwnedFd::from_raw_fd(donor_pidfd) };
-    if ranges.is_null()
-        || !ranges.is_aligned()
-        || !(1..=MAX_RAM_REGIONS).contains(&range_count)
-        || checkpoint.is_null()
-        || !(1..=MAX_CHECKPOINT_BYTES).contains(&checkpoint_len)
-    {
+    if checkpoint.is_null() || !(1..=MAX_CHECKPOINT_BYTES).contains(&checkpoint_len) {
         return -libc::EINVAL;
     }
     let mut contexts = CTX_MAP.lock().unwrap();
@@ -93,13 +118,9 @@ pub unsafe extern "C" fn krun_import_worker_kernel_cow_v1(
         return -libc::EBUSY;
     }
     // SAFETY: callers supply a valid array of the bounded size.
-    let ranges = unsafe { std::slice::from_raw_parts(ranges, range_count) }
-        .iter()
-        .map(|range| (GuestAddress(range.guest_start), range.size as usize))
-        .collect::<Vec<_>>();
-    let layout = match RamLayout::new(&ranges) {
+    let layout = match unsafe { worker_layout(ranges, range_count) } {
         Ok(layout) => layout,
-        Err(error) => return set_io_error(error),
+        Err(code) => return code,
     };
     // SAFETY: the caller supplies the exact held donor and this is the
     // single-threaded Worker bootstrap for these target credentials.
@@ -117,9 +138,67 @@ pub unsafe extern "C" fn krun_import_worker_kernel_cow_v1(
     };
     // SAFETY: per the contract the caller keeps this bounded buffer readable.
     // Interpret the checkpoint only after the verified drop.
-    let checkpoint = unsafe { std::slice::from_raw_parts(checkpoint, checkpoint_len) }.to_vec();
+    let checkpoint = unsafe { slice::from_raw_parts(checkpoint, checkpoint_len) }.to_vec();
     ctx.worker_kernel_cow = Some(Boot::Target { ram, checkpoint });
     0
+}
+
+/// Retain one read-only capture in the dedicated final anchor process.
+///
+/// # Safety
+/// The Worker transfers an owned pidfd of its exact authenticated held donor.
+/// The input array must be readable and refer to that cut. Call before starting
+/// any threads or installing the sandbox, and terminate the bootstrap on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_import_worker_kernel_cow_anchor_v1(
+    donor_pidfd: i32,
+    ranges: *const KrunWorkerCowRangeV1,
+    range_count: usize,
+    uid: u32,
+    gid: u32,
+) -> i32 {
+    clear_last_error();
+    if donor_pidfd < 0 {
+        return -libc::EINVAL;
+    }
+    // SAFETY: ownership transfers at entry, including on validation failure.
+    let donor = unsafe { OwnedFd::from_raw_fd(donor_pidfd) };
+    // SAFETY: the caller provides the bounded input array.
+    let layout = match unsafe { worker_layout(ranges, range_count) } {
+        Ok(layout) => layout,
+        Err(code) => return code,
+    };
+    let mut retained = ANCHOR.lock().unwrap();
+    if retained.is_some() {
+        return -libc::EBUSY;
+    }
+    // SAFETY: the caller proves the exact held donor and bootstrap scope.
+    match unsafe { import_anchor_for_worker(donor, &layout, uid, gid) } {
+        Ok(anchor) => {
+            *retained = Some(anchor);
+            0
+        }
+        Err(error) => set_io_error(error),
+    }
+}
+
+/// Stream the retained anchor in guest-region order.
+///
+/// # Safety
+/// The caller supplies a live, writable output descriptor for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_write_worker_kernel_cow_anchor_v1(fd: i32) -> i32 {
+    clear_last_error();
+    if fd < 0 {
+        return -libc::EINVAL;
+    }
+    let retained = ANCHOR.lock().unwrap();
+    let Some(anchor) = retained.as_ref() else {
+        return -libc::ENOENT;
+    };
+    // SAFETY: the output remains open and owned by the caller.
+    let output = unsafe { BorrowedFd::borrow_raw(fd) };
+    anchor.write_to(output).map_or_else(set_io_error, |_| 0)
 }
 
 pub(super) fn validate(ctx: &ContextConfig, parked_target: bool) -> Result<(), String> {
