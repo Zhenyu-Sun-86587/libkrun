@@ -181,8 +181,7 @@ mod smoke {
     #[cfg(feature = "blk")]
     mod held_vmm {
         use super::*;
-        use devices::virtio::guest_gate::TargetScope;
-        use krun_vmm::Vmm;
+        use devices::virtio::{guest_gate::TargetScope, persist::DeviceSnapshot};
         use krun_vmm::builder::{build_kernel_cow_source, build_kernel_cow_target};
         use krun_vmm::kernel_cow::{
             MAX_CHECKPOINT_BYTES, PreparedRam, RAM_PROFILE, import_anchor_for_worker,
@@ -190,6 +189,7 @@ mod smoke {
         };
         use krun_vmm::resources::VmResources;
         use krun_vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
+        use krun_vmm::{VmCheckpoint, Vmm};
         use polly::event_manager::EventManager;
         use std::io::Read;
         use std::os::fd::AsRawFd;
@@ -302,7 +302,7 @@ mod smoke {
             }
         }
 
-        fn park(source: &mut Vmm, memory: &GuestMemoryMmap) {
+        fn park(source: &mut Vmm, memory: &GuestMemoryMmap, scope: &str) {
             let inventory = source.deep_virtio_inventory().unwrap();
             let inventory: serde_json::Value =
                 serde_json::from_str(inventory.strip_prefix("OK ").unwrap()).unwrap();
@@ -316,7 +316,7 @@ mod smoke {
             let address = gate["mmio_address"].as_u64().unwrap();
             assert!((0x40000000..0x1_00000000).contains(&address));
             memory.write_obj(address, GATE).unwrap();
-            let prepare = format!("{TOKEN} 1000 10000");
+            let prepare = format!("{scope} 1000 10000");
             wait_for_phase(
                 || {
                     source
@@ -325,16 +325,68 @@ mod smoke {
                 },
                 "armed",
             );
-            let park = format!("{TOKEN} {:032x}", u128::from_be_bytes(ANCHOR));
+            let park = format!("{scope} {:032x}", u128::from_be_bytes(ANCHOR));
             source.guest_gate_control("GUEST_GATE_PARK", &park).unwrap();
             wait_for_phase(
                 || {
                     source
-                        .guest_gate_control("GUEST_GATE_QUERY", TOKEN)
+                        .guest_gate_control("GUEST_GATE_QUERY", scope)
                         .unwrap()
                 },
                 "parked",
             );
+        }
+
+        fn capture_twice_in_standby(source: &mut Vmm, memory: &GuestMemoryMmap) {
+            const STANDBY: &str = "2 00000000000000000000000000000002";
+            park(source, memory, STANDBY);
+            let stable = source
+                .standby_control("STANDBY_ENTER", &format!("{STANDBY} managed"))
+                .unwrap();
+            memory.write_obj(0x62_u8, COMMAND).unwrap();
+            for operation in [3, 4] {
+                let scope = format!("{operation} {operation:032x}");
+                let prepare = format!("{scope} {STANDBY}");
+                let held = source.prepare_held_kernel_cow(&prepare).unwrap();
+                let state: serde_json::Value =
+                    serde_json::from_str(held.strip_prefix("OK ").unwrap()).unwrap();
+                assert_eq!(state["session"], operation);
+                assert_eq!(state["source_disposition"], "HELD");
+                assert_eq!(state["from_standby"], true);
+                assert_eq!(source.prepare_held_kernel_cow(&prepare).unwrap(), held);
+                assert!(source.prepare_held_kernel_cow(&scope).is_err());
+
+                let mut wire = Vec::new();
+                source
+                    .held_kernel_cow_export(&scope)
+                    .unwrap()
+                    .write_to(&mut wire)
+                    .unwrap();
+                let header_end = wire.iter().position(|&byte| byte == b'\n').unwrap();
+                let checkpoint = VmCheckpoint::deserialize(&wire[header_end + 1..]).unwrap();
+                assert!(checkpoint.devices.devices.iter().any(|device| {
+                    matches!(device, DeviceSnapshot::ParkedGuestGate(gate)
+                        if gate.source_session == 2 && gate.anchor == ANCHOR)
+                }));
+
+                // Abandon this export after inspecting it. The other test
+                // exercises importing RAM and continuing the child.
+                source.abandon_held_kernel_cow(&scope).unwrap();
+                source.abandon_held_kernel_cow(&scope).unwrap();
+                let finish = format!("{scope} RETURN_STANDBY");
+                let returned = source
+                    .held_capture_control("CAPTURE_FINISH", &finish)
+                    .unwrap();
+                assert_eq!(source.prepare_held_kernel_cow(&prepare).unwrap(), returned);
+                assert_eq!(
+                    source.standby_control("STANDBY_QUERY", STANDBY).unwrap(),
+                    stable
+                );
+                assert_eq!(memory.read_obj::<u8>(MARKER).unwrap(), 0x42);
+                assert_eq!(memory.read_obj::<u8>(COMMAND).unwrap(), 0x62);
+            }
+            let stale = format!("3 {:032x} {STANDBY}", 3);
+            assert!(source.prepare_held_kernel_cow(&stale).is_err());
         }
 
         fn activate(child: &mut Vmm, memory: &GuestMemoryMmap) {
@@ -367,13 +419,12 @@ mod smoke {
             assert_cow_denied_in_guest_runtime();
             let mut events = EventManager::new().unwrap();
             let (sender, _receiver) = crossbeam_channel::unbounded();
-            let source =
-                build_kernel_cow_source(&resources(path), &mut events, None, sender, kernel)
-                    .unwrap();
-            let memory = source.lock().unwrap().guest_memory().clone();
+            let vmm = build_kernel_cow_source(&resources(path), &mut events, None, sender, kernel)
+                .unwrap();
+            let memory = vmm.lock().unwrap().guest_memory().clone();
             until(&memory, MARKER, 0x31);
-            let mut source = source.lock().unwrap();
-            park(&mut source, &memory);
+            let mut source = vmm.lock().unwrap();
+            park(&mut source, &memory, TOKEN);
             source.prepare_held_kernel_cow(TOKEN).unwrap();
             assert!(
                 source
@@ -430,6 +481,7 @@ mod smoke {
                 },
                 "released",
             );
+            source.held_capture_control("CAPTURE_QUERY", TOKEN).unwrap();
             drop(source);
             guest_command(&memory, 0x42);
             until(&memory, MARKER, 0x42);
@@ -437,6 +489,7 @@ mod smoke {
             output.flush().unwrap();
             line(&mut input, "check");
             until(&memory, MARKER, 0x42);
+            capture_twice_in_standby(&mut vmm.lock().unwrap(), &memory);
             writeln!(output, "isolated").unwrap();
             output.flush().unwrap();
             line(&mut input, "exit");
@@ -699,6 +752,9 @@ mod smoke {
             until(&memory, MARKER, 0x53);
             writeln!(input, "check").unwrap();
             line(&mut output, "isolated");
+            println!(
+                "libkrun repeated Standby: two distinct capture scopes, replay preserved the parked Guest"
+            );
             writeln!(input, "exit").unwrap();
             assert!(source.0.wait().unwrap().success());
             if let Some((commands, responses, anchor)) = retained.as_mut() {

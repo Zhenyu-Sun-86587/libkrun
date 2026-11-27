@@ -51,6 +51,7 @@ timeout -k 5 "${BOOT_TIMEOUT:-120}" "$qemu" -no-user-config -machine pc,accel=kv
 tr -d '\r' <"$log" >"$stage/serial.log"
 if ! grep -q '^libkrun Worker CoW: ' "$stage/serial.log" ||
    ! grep -q '^libkrun RO anchor: ' "$stage/serial.log" ||
+   ! grep -q '^libkrun repeated Standby: ' "$stage/serial.log" ||
    ! grep -q '^libkrun held CoW VMM: ' "$stage/serial.log" ||
    ! grep -qx 'SMOLVM_COW_WORKER_TAINTED=0' "$stage/serial.log" ||
    ! grep -qx 'SMOLVM_COW_WORKER_RESULT=0' "$stage/serial.log"; then

@@ -22,18 +22,21 @@ struct Token {
 impl Token {
     fn parse(arguments: &str) -> Result<(Self, Vec<&str>), String> {
         let mut words = arguments.split_ascii_whitespace();
-        let session = words
-            .next()
+        let token = Self::parse_fields(words.next(), words.next())?;
+        Ok((token, words.collect()))
+    }
+
+    fn parse_fields(session: Option<&str>, nonce: Option<&str>) -> Result<Self, String> {
+        let session = session
             .and_then(|s| s.parse().ok())
             .filter(|s| *s != 0)
             .ok_or("EINVAL expected a nonzero capture session")?;
-        let nonce = words
-            .next()
+        let nonce = nonce
             .filter(|s| s.len() == 32 && s.bytes().all(|c| c.is_ascii_hexdigit()))
             .and_then(|s| u128::from_str_radix(s, 16).ok())
             .filter(|s| *s != 0)
             .ok_or("EINVAL expected a 128-bit capture challenge")?;
-        Ok((Self { session, nonce }, words.collect()))
+        Ok(Self { session, nonce })
     }
 }
 
@@ -67,6 +70,7 @@ enum CapturePoint {
 
 pub(super) struct Capture {
     token: Token,
+    gate_token: Token,
     managed: bool,
     backend: RamBackend,
     from_standby: bool,
@@ -423,18 +427,15 @@ impl Vmm {
                         .into(),
                 );
             }
+            let capture = self.capture_control.capture.as_ref().unwrap();
             *gate = DeviceSnapshot::ParkedGuestGate(ParkedState {
                 uplink,
                 acked_features: gate.acked_features(),
-                source_session: token.session,
+                source_session: capture.gate_token.session,
                 anchor,
                 helper,
-                writer_hold_token: self
-                    .capture_control
-                    .capture
-                    .as_ref()
-                    .filter(|capture| !capture.writers.is_empty())
-                    .map(|_| format!("{:032x}", token.nonce)),
+                writer_hold_token: (!capture.writers.is_empty())
+                    .then(|| format!("{:032x}", token.nonce)),
                 bindings: self.parked_bindings()?,
             });
         }
@@ -518,27 +519,39 @@ impl Vmm {
     }
 
     pub fn held_capture_control(&mut self, verb: &str, arguments: &str) -> Result<String, String> {
-        self.held_capture_control_with_backend(verb, arguments, RamBackend::Native)
+        let (token, fields) = Token::parse(arguments)?;
+        self.held_capture_control_with_backend(verb, token, &fields, RamBackend::Native, None)
     }
 
     /// Enter the same CPU and device boundary used for Native capture, leaving
     /// RAM in place while the authorized Worker imports this held cut.
+    /// On an existing Standby, the Worker can identify the unchanged Guest
+    /// hold separately from this capture's fresh transaction scope.
     pub fn prepare_held_kernel_cow(&mut self, arguments: &str) -> Result<String, String> {
+        let (token, fields) = Token::parse(arguments)?;
+        let standby = match fields.as_slice() {
+            [] => None,
+            [session, nonce] => Some(Token::parse_fields(Some(session), Some(nonce))?),
+            _ => return Err("EINVAL expected an optional original Standby scope".into()),
+        };
         self.held_capture_control_with_backend(
             "CAPTURE_PREPARE",
-            &format!("{arguments} parked"),
+            token,
+            &["parked"],
             RamBackend::KernelCow,
+            standby,
         )
     }
 
     fn held_capture_control_with_backend(
         &mut self,
         verb: &str,
-        arguments: &str,
+        token: Token,
+        fields: &[&str],
         backend: RamBackend,
+        standby: Option<Token>,
     ) -> Result<String, String> {
-        let (token, fields) = Token::parse(arguments)?;
-        match (verb, fields.as_slice()) {
+        match (verb, fields) {
             ("CAPTURE_PREPARE", ["raw" | "parked"])
             | (
                 "CAPTURE_QUERY"
@@ -551,6 +564,7 @@ impl Vmm {
             | ("CAPTURE_FINISH", ["CONTINUE" | "KEEP_HELD" | "RETURN_STANDBY"]) => (),
             _ => return Err("EINVAL invalid held capture parameters or source disposition".into()),
         }
+        let gate_token = standby.unwrap_or(token);
         let current = self.capture_control.capture.as_ref();
         let matching = current.is_some_and(|c| c.token == token);
         if verb == "CAPTURE_PREPARE" && !matching {
@@ -561,10 +575,19 @@ impl Vmm {
             let from_standby = managed
                 && self.capture_control.standby.as_ref().is_some_and(|s| {
                     s.managed
-                        && s.sequence == token.session
-                        && s.nonce == token.nonce
+                        && s.sequence == gate_token.session
+                        && s.nonce == gate_token.nonce
                         && s.disposition == super::Disposition::Standby
                 });
+            if standby.is_some()
+                && (!from_standby
+                    || token.session <= gate_token.session
+                    || token.nonce == gate_token.nonce)
+            {
+                return Err(
+                    "ESTALE capture requires its exact earlier managed Standby scope".into(),
+                );
+            }
             if from_standby {
                 if self.run_state != VmmRunState::Paused
                     || !self.devices_quiesced
@@ -581,7 +604,7 @@ impl Vmm {
                 .ok_or("ENOTSUP native deep control is missing")?
                 .lock()
                 .unwrap();
-            if (managed && !gate.parked(token.session, token.nonce))
+            if (managed && !gate.parked(gate_token.session, gate_token.nonce))
                 || (!managed && !gate.allows_raw_standby())
             {
                 return Err("EBUSY Guest gate differs from the requested capture mode".into());
@@ -629,6 +652,7 @@ impl Vmm {
             };
             self.capture_control.capture = Some(Capture {
                 token,
+                gate_token,
                 managed,
                 backend,
                 from_standby,
@@ -668,9 +692,15 @@ impl Vmm {
         } else if !matching {
             return Err("ESTALE unknown capture session".into());
         } else if verb == "CAPTURE_PREPARE"
-            && current.is_some_and(|c| c.backend != backend || c.managed != (fields == ["parked"]))
+            && current.is_some_and(|c| {
+                c.backend != backend
+                    || c.managed != (fields == ["parked"])
+                    || c.gate_token != gate_token
+            })
         {
-            return Err("EINVAL capture mode differs from original request".into());
+            return Err(
+                "EINVAL capture mode or Standby scope differs from original request".into(),
+            );
         } else if verb == "CAPTURE_DROP_EXPORT" {
             let record = self.capture_control.capture.as_mut().unwrap();
             if !record.managed
@@ -763,6 +793,7 @@ impl Vmm {
                 }
             } else if decision != Phase::Held {
                 let managed = record.managed;
+                let gate_token = record.gate_token;
                 let record = self.capture_control.capture.as_mut().unwrap();
                 record.cancelled = cancelled;
                 if cancelled {
@@ -778,7 +809,7 @@ impl Vmm {
                 } else {
                     record.phase = Phase::Unknown;
                     if managed {
-                        let arguments = format!("{} {:032x}", token.session, token.nonce);
+                        let arguments = format!("{} {:032x}", gate_token.session, gate_token.nonce);
                         self.guest_gate
                             .as_ref()
                             .unwrap()
@@ -796,14 +827,15 @@ impl Vmm {
                 }
             }
         }
-        if self.capture_control.capture.as_ref().unwrap().phase == Phase::Thawing
+        let record = self.capture_control.capture.as_ref().unwrap();
+        if record.phase == Phase::Thawing
             && self
                 .guest_gate
                 .as_ref()
                 .unwrap()
                 .lock()
                 .unwrap()
-                .source_released(token.session, token.nonce)
+                .source_released(record.gate_token.session, record.gate_token.nonce)
         {
             let record = self.capture_control.capture.as_mut().unwrap();
             record.phase = if record.cancelled {
