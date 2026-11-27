@@ -118,6 +118,25 @@ pub enum MuxerRx {
     },
 }
 
+#[cfg(target_os = "linux")]
+impl MuxerRx {
+    pub(super) fn stream_proxy_id(&self) -> Option<u64> {
+        let (local, peer) = match self {
+            Self::Reset { local_port, peer_port }
+            | Self::Shutdown { local_port, peer_port, .. }
+            | Self::OpRequest { local_port, peer_port }
+            | Self::OpResponse { local_port, peer_port }
+            | Self::CreditRequest { local_port, peer_port, .. }
+            | Self::CreditUpdate { local_port, peer_port, .. } => (*local_port, *peer_port),
+            _ => return None,
+        };
+        Some((u64::from(peer) << 32) | u64::from(local))
+    }
+}
+
+#[cfg(target_os = "linux")]
+const MANAGED_CREDENTIAL_RELAY_PORT: u32 = 6001;
+
 #[cfg(test)]
 thread_local! {
     static BEFORE_PENDING_PACKET: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
@@ -303,6 +322,44 @@ impl VsockMuxer {
     }
 
     #[cfg(target_os = "linux")]
+    pub(crate) fn credential_relay_path(&self) -> Option<&std::path::Path> {
+        self.parked_ports()?;
+        let (path, listen) = self.unix_ipc_port_map.as_ref()?.get(&MANAGED_CREDENTIAL_RELAY_PORT)?;
+        (!*listen).then_some(path.as_path())
+    }
+
+    /// Fence connections outside the established outgoing relay for this source.
+    /// The host and virtqueue gates are already drained. The target will reset
+    /// the whole transport and never receive this process's sockets or queues.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn fence_fork_peers(&self) -> Result<(), String> {
+        let relay = self.credential_relay_path().ok_or("source has no managed credential relay")?;
+        let mut proxies = self.proxy_map.write().unwrap();
+        let mut closed = HashSet::new();
+        let mut retained = false;
+        for (&id, proxy) in proxies.iter() {
+            let proxy = proxy.lock().unwrap();
+            if id as u32 == MANAGED_CREDENTIAL_RELAY_PORT && proxy.established_unix_peer(relay) {
+                retained = true;
+            } else if !proxy.is_listener() {
+                closed.insert(id);
+            }
+        }
+        if !retained {
+            return Err("source credential relay has no established peer".into());
+        }
+        self.rxq.lock().unwrap().reset_stream_peers(&closed)?;
+        let mut result = Ok(());
+        for id in closed {
+            let proxy = proxies.remove(&id).unwrap();
+            if let Err(error) = Self::shutdown_parked_peer(&**proxy.lock().unwrap()) {
+                result = Err(error);
+            }
+        }
+        result
+    }
+
+    #[cfg(target_os = "linux")]
     pub(crate) fn fence_parked_peers(&self) -> Result<(), String> {
         // The host event gate is drained. Shutdown disconnects the peer even
         // if a reaper briefly retains a reference to its proxy.
@@ -311,14 +368,20 @@ impl VsockMuxer {
             if proxy.is_listener() {
                 continue;
             }
-            if unsafe { libc::shutdown(proxy.poll_handle(), libc::SHUT_RDWR) } < 0 {
-                let error = std::io::Error::last_os_error();
-                if !matches!(error.raw_os_error(), Some(libc::ENOTCONN | libc::EINVAL)) {
-                    return Err(format!("close a parked vsock peer: {error}"));
-                }
-            }
+            Self::shutdown_parked_peer(&**proxy)?;
         }
         self.reset_connections();
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn shutdown_parked_peer(proxy: &dyn Proxy) -> Result<(), String> {
+        if unsafe { libc::shutdown(proxy.poll_handle(), libc::SHUT_RDWR) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::ENOTCONN | libc::EINVAL)) {
+                return Err(format!("close a parked vsock peer: {error}"));
+            }
+        }
         Ok(())
     }
 

@@ -316,6 +316,10 @@ pub trait Proxy: Send {
     fn is_listener(&self) -> bool {
         false
     }
+    #[cfg(target_os = "linux")]
+    fn established_unix_peer(&self, _path: &std::path::Path) -> bool {
+        false
+    }
     /// If this proxy is a live TSI inbound-port-forward listener, return its
     /// descriptor so it can be snapshotted and re-established on a fork clone
     /// (see [`ListenerDesc`]). `None` for everything else (connections, the

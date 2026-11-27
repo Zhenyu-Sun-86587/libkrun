@@ -16,6 +16,8 @@
 /// the connection pool. When an out-of-sync is drained, the muxer will discard it, and attempt to
 /// rebuild a synced one.
 use std::collections::VecDeque;
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
 
 use super::defs;
 use super::defs::uapi;
@@ -75,6 +77,21 @@ impl MuxerRxQ {
     pub fn clear(&mut self) {
         self.q.clear();
         self.synced = true;
+    }
+
+    /// Replace queued control messages for closed Unix streams with per-peer resets.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn reset_stream_peers(&mut self, closed: &HashSet<u64>) -> Result<(), String> {
+        let keep = |rx: &MuxerRx| !rx.stream_proxy_id().is_some_and(|id| closed.contains(&id));
+        if !self.synced || self.q.iter().filter(|rx| keep(rx)).count() + closed.len() > Self::SIZE {
+            return Err("vsock has insufficient room to fence non-relay peers".into());
+        }
+        self.q.retain(keep);
+        self.q.extend(closed.iter().map(|&id| MuxerRx::Reset {
+            local_port: id as u32,
+            peer_port: (id >> 32) as u32,
+        }));
+        Ok(())
     }
 
     /// Check if the RX queue is synchronized with the connection pool.

@@ -2146,6 +2146,16 @@ fn handle_control_stream(
                 feature = "blk",
                 not(feature = "tee")
             ))]
+            if verb == "STANDBY_FORK_ENTER" && !vmm::retained_fds::worker_recovery_peer(&stream) {
+                let _ = stream.write_all(b"ERR EPERM relay-preserving fork requires the Worker control peer\n");
+                return;
+            }
+            #[cfg(all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                feature = "blk",
+                not(feature = "tee")
+            ))]
             if vmm.lock().unwrap().deep_control_holds_vmm()
                 && !matches!(
                     verb.as_str(),
@@ -2167,6 +2177,7 @@ fn handle_control_stream(
                         | "CAPTURE_BLOCK_PIVOT"
                         | "CAPTURE_BLOCK_PIVOT_ABORT"
                         | "STANDBY_ENTER"
+                        | "STANDBY_FORK_ENTER"
                         | "STANDBY_QUERY"
                         | "STANDBY_WAKE"
                         | "GUEST_GATE_QUERY"
@@ -2312,7 +2323,7 @@ fn handle_control_stream(
                     feature = "blk",
                     not(feature = "tee")
                 ))]
-                "STANDBY_ENTER" | "STANDBY_QUERY" | "STANDBY_WAKE" => vmm
+                "STANDBY_ENTER" | "STANDBY_FORK_ENTER" | "STANDBY_QUERY" | "STANDBY_WAKE" => vmm
                     .lock()
                     .unwrap()
                     .standby_control(&verb, _arg)
