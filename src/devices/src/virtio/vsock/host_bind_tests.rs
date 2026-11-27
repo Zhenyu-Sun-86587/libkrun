@@ -1918,7 +1918,9 @@ fn relay_fork_keeps_only_the_source_relay_and_fences_the_child() {
     for (port, listener) in [(relay_port, &relay), (other_port, &other)] {
         listener.set_nonblocking(true).unwrap();
         let mut pkt = f.packet(port, &[]);
-        pkt.set_type(uapi::VSOCK_TYPE_STREAM).set_op(uapi::VSOCK_OP_REQUEST);
+        pkt.set_type(uapi::VSOCK_TYPE_STREAM)
+            .set_op(uapi::VSOCK_OP_REQUEST)
+            .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32);
         f.muxer.send_stream_pkt(&pkt).unwrap();
     }
     let (mut relay, _) = relay.accept().unwrap();
@@ -1928,6 +1930,18 @@ fn relay_fork_keeps_only_the_source_relay_and_fences_the_child() {
     }
     let relay_id = (u64::from(CONTROL) << 32) | u64::from(relay_port);
     let original_relay = f.muxer.proxy_map.read().unwrap()[&relay_id].clone();
+    {
+        // The Guest has handled the connection handshakes before the cut.
+        let mut pending = f.muxer.rxq.lock().unwrap();
+        pending.clear();
+        for port in [relay_port, other_port] {
+            assert!(pending.push(MuxerRx::CreditUpdate {
+                local_port: port,
+                peer_port: CONTROL,
+                fwd_cnt: 0,
+            }));
+        }
+    }
 
     let tx = TestQueue::new(GuestAddress(0x1000), &f.mem, 8);
     f.packet(relay_port, b"before-cut").set_type(uapi::VSOCK_TYPE_STREAM);
@@ -1968,7 +1982,7 @@ fn relay_fork_keeps_only_the_source_relay_and_fences_the_child() {
     target.queue_rx = Some(Arc::new(Mutex::new(target_rx.create_queue())));
     target.queue_tx = Some(Arc::new(Mutex::new(target_tx.create_queue())));
     target.queue_ev = Some(Arc::new(Mutex::new(target_ev.create_queue())));
-    target.device_state = DeviceState::Activated(target_mem, irq);
+    target.device_state = DeviceState::Activated(target_mem.clone(), irq);
     target.restore_state(&state).unwrap();
     assert_eq!(target_ev.used.idx.get(), 1);
     assert!(!target.publish_parked_backend().unwrap());

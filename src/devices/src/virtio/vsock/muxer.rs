@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -123,9 +125,9 @@ impl MuxerRx {
     pub(super) fn stream_proxy_id(&self) -> Option<u64> {
         let (local, peer) = match self {
             Self::Reset { local_port, peer_port }
-            | Self::Shutdown { local_port, peer_port, .. }
             | Self::OpRequest { local_port, peer_port }
             | Self::OpResponse { local_port, peer_port }
+            | Self::Shutdown { local_port, peer_port, .. }
             | Self::CreditRequest { local_port, peer_port, .. }
             | Self::CreditUpdate { local_port, peer_port, .. } => (*local_port, *peer_port),
             _ => return None,
@@ -322,9 +324,12 @@ impl VsockMuxer {
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn credential_relay_path(&self) -> Option<&std::path::Path> {
+    pub(crate) fn credential_relay_path(&self) -> Option<&Path> {
         self.parked_ports()?;
-        let (path, listen) = self.unix_ipc_port_map.as_ref()?.get(&MANAGED_CREDENTIAL_RELAY_PORT)?;
+        let (path, listen) = self
+            .unix_ipc_port_map
+            .as_ref()?
+            .get(&MANAGED_CREDENTIAL_RELAY_PORT)?;
         (!*listen).then_some(path.as_path())
     }
 
@@ -333,7 +338,9 @@ impl VsockMuxer {
     /// the whole transport and never receive this process's sockets or queues.
     #[cfg(target_os = "linux")]
     pub(crate) fn fence_fork_peers(&self) -> Result<(), String> {
-        let relay = self.credential_relay_path().ok_or("source has no managed credential relay")?;
+        let relay = self
+            .credential_relay_path()
+            .ok_or("source has no managed credential relay")?;
         let mut proxies = self.proxy_map.write().unwrap();
         let mut closed = HashSet::new();
         let mut retained = false;

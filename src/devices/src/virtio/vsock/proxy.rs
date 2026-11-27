@@ -4,6 +4,8 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::time::Instant;
 
 use socket2::Socket;
@@ -317,7 +319,7 @@ pub trait Proxy: Send {
         false
     }
     #[cfg(target_os = "linux")]
-    fn established_unix_peer(&self, _path: &std::path::Path) -> bool {
+    fn established_unix_peer(&self, _path: &Path) -> bool {
         false
     }
     /// If this proxy is a live TSI inbound-port-forward listener, return its

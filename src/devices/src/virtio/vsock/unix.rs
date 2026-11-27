@@ -6,6 +6,8 @@ use super::{
 use std::collections::{HashMap, VecDeque};
 use std::net::Shutdown;
 use std::num::Wrapping;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -438,9 +440,12 @@ impl Proxy for UnixProxy {
     }
 
     #[cfg(target_os = "linux")]
-    fn established_unix_peer(&self, path: &std::path::Path) -> bool {
+    fn established_unix_peer(&self, path: &Path) -> bool {
         self.path == path
-            && matches!(self.status, ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate)
+            && matches!(
+                self.status,
+                ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+            )
     }
 
     fn connect(&mut self, _pkt: &VsockPacket, _req: TsiConnectReq) -> ProxyUpdate {
