@@ -390,9 +390,17 @@ impl Vmm {
         self.devices_quiesced = true;
         self.mmio_device_manager.validate_standby_boundary()?;
         if managed {
-            let preserve = self.capture_control.capture.as_ref().unwrap().preserve_credential_relay;
-            self.mmio_device_manager
+            let preserve = self
+                .capture_control
+                .capture
+                .as_ref()
+                .unwrap()
+                .preserve_credential_relay;
+            let fenced = self.mmio_device_manager
                 .with_vsock(|vsock| vsock.fence_parked_source(preserve))?;
+            if preserve && fenced.is_none() {
+                return Err("source credential relay disappeared before the capture".into());
+            }
         }
         let inventory = self.mmio_device_manager.capture_inventory()?;
         let vcpu_states = self.save_vcpu_states().map_err(|e| e.to_string())?;
