@@ -3183,10 +3183,11 @@ fn create_guest_memory_with_profile(
                 };
             let (info, mut regions) =
                 arch::arch_memory_regions(mem_size, Some(kernel_guest_addr), kernel_size, 0, None);
-            if cfg!(target_os = "linux") && !matches!(_memory_profile, BootMemory::Native) {
-                // Keep the same complete GPA geometry as a normal bundled
-                // kernel boot so the ordinary durable StatePoint reader can
-                // restore it on a Worker without the CoW syscall.
+            if cfg!(target_os = "linux")
+                && (restore_mem.is_some() || !matches!(_memory_profile, BootMemory::Native))
+            {
+                // Restores and fixed-RAM boots include the bundled-kernel slot
+                // in their explicit guest RAM layout.
                 regions.insert(1, (GuestAddress(kernel_guest_addr), kernel_size));
             }
             (info, regions)
@@ -3222,8 +3223,46 @@ fn create_guest_memory_with_profile(
 
     let mut shm_manager = ShmManager::new(&arch_mem_info);
 
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    let bootstrap_without_shm = vm_resources.block_bootstrap_fs.filter(|&index| {
+        vm_resources.guest_gate
+            && vm_resources.fs.get(index).is_some_and(|fs| {
+                fs.fs_id == "/dev/root" && fs.shared_dir.is_none() && !fs.live
+            })
+            && (!matches!(_memory_profile, BootMemory::Native)
+                || vm_resources.guest_target.is_some()
+                    && restore_mem.as_ref().is_some_and(|restored| {
+                        use vm_memory::GuestMemoryRegion;
+                        // The verified parked StatePoint carries its complete
+                        // GPA layout. Native captures with the legacy DAX slot
+                        // keep it. A plain RAM image came from the same
+                        // bootstrap device with its window disabled.
+                        restored
+                            .guest_memory
+                            .iter()
+                            .map(|region| (region.start_addr(), region.len() as usize))
+                            .eq(arch_mem_regions.iter().copied())
+                    }))
+    });
+
     #[cfg(not(feature = "tee"))]
     for (index, fs) in vm_resources.fs.iter().enumerate() {
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            feature = "blk",
+            not(feature = "tee")
+        ))]
+        if bootstrap_without_shm == Some(index) {
+            // The block bootstrap only needs ordinary FUSE reads for init.
+            // Its optional DAX aperture can replace its pages with MAP_FIXED.
+            continue;
+        }
         if let Some(shm_size) = fs.shm_size {
             shm_manager
                 .create_fs_region(index, shm_size)
@@ -4855,6 +4894,106 @@ pub mod tests {
 
     use super::*;
     use crate::vmm_config::kernel_bundle::KernelBundle;
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(any(feature = "tee", feature = "aws-nitro"))
+    ))]
+    mod block_bootstrap_shm {
+        use super::*;
+        use devices::virtio::guest_gate::TargetScope;
+
+        const BOOT_RAM_MIB: usize = 64;
+        const BOOTSTRAP_SHM: usize = 1 << 29;
+
+        fn resources() -> VmResources {
+            let mut resources = VmResources::default();
+            resources.guest_gate = true;
+            resources.kernel_bundle = Some(KernelBundle {
+                host_addr: 0x1000,
+                guest_addr: 0x10_0000,
+                entry_addr: 0x10_0000,
+                size: 4096,
+            });
+            resources.block_bootstrap_fs = Some(0);
+            resources.add_fs_device(FsDeviceConfig {
+                fs_id: "/dev/root".into(),
+                shared_dir: None,
+                shm_size: Some(BOOTSTRAP_SHM),
+                read_only: false,
+                override_stat: false,
+                negative_entries: false,
+                live: false,
+                default_owner: None,
+                virtual_entries: Vec::new(),
+            });
+            resources
+        }
+
+        #[test]
+        fn kernel_cow_omits_the_bootstrap_window_and_refuses_passthrough_shm() {
+            let mut resources = resources();
+            let build_error = |resources: &VmResources| {
+                create_guest_memory_with_profile(
+                    BOOT_RAM_MIB,
+                    resources,
+                    &Payload::KernelMmap,
+                    None,
+                    BootMemory::KernelCowTarget,
+                )
+                .err()
+                .unwrap()
+                .to_string()
+            };
+            // Without an imported image a supported geometry reaches the
+            // target layout error, beyond the shared-memory guard.
+            assert!(build_error(&resources).contains("imported Kernel CoW RAM"));
+            resources.fs[0].shared_dir = Some("/tmp".into());
+            assert!(build_error(&resources).contains("no device SHM"));
+        }
+
+        #[test]
+        fn native_parked_restore_reuses_the_captured_bootstrap_geometry() {
+            let mut resources = resources();
+            resources.guest_target = Some(TargetScope {
+                anchor: [1; 16],
+                epoch: 1,
+                context: [2; 32],
+            });
+            let bundle = resources.kernel_bundle.as_ref().unwrap();
+            for old_window in [false, true] {
+                let (info, mut ranges) = arch::arch_memory_regions(
+                    BOOT_RAM_MIB << 20,
+                    Some(bundle.guest_addr),
+                    bundle.size,
+                    0,
+                    None,
+                );
+                ranges.insert(1, (GuestAddress(bundle.guest_addr), bundle.size));
+                if old_window {
+                    ranges.push((GuestAddress(info.shm_start_addr), BOOTSTRAP_SHM));
+                }
+                let restore = RestoredMemory {
+                    guest_memory: GuestMemoryMmap::from_ranges(&ranges).unwrap(),
+                    fork_backed_regions: vec![false; ranges.len()],
+                    layered_ram: None,
+                    cow_backing: Vec::new(),
+                };
+                let (memory, _, shm, _) = create_guest_memory_with_profile(
+                    BOOT_RAM_MIB,
+                    &resources,
+                    &Payload::KernelMmap,
+                    Some(restore),
+                    BootMemory::Native,
+                )
+                .unwrap();
+                assert_eq!(shm.fs_region(0).is_some(), old_window);
+                assert_eq!(memory.num_regions(), ranges.len());
+            }
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

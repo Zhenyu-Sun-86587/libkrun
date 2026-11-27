@@ -231,6 +231,49 @@ mod tests {
     use super::*;
     use std::os::fd::IntoRawFd;
 
+    #[cfg(not(feature = "aws-nitro"))]
+    #[test]
+    fn block_root_api_marks_the_virtual_bootstrap_after_other_shares() {
+        use crate::{
+            krun_add_disk, krun_add_virtiofs, krun_create_ctx, krun_free_ctx,
+            krun_set_root_disk_remount,
+        };
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use utils::tempfile::TempFile;
+
+        let disk = TempFile::new().unwrap();
+        disk.as_file().set_len(4096).unwrap();
+        let path = CString::new(disk.as_path().as_os_str().as_bytes()).unwrap();
+        let id = u32::try_from(krun_create_ctx()).unwrap();
+        // SAFETY: each argument is a C string valid throughout its call.
+        unsafe {
+            assert_eq!(
+                krun_add_virtiofs(id, c"extra".as_ptr(), c"/tmp".as_ptr()),
+                0
+            );
+            assert_eq!(krun_add_disk(id, c"root".as_ptr(), path.as_ptr(), false), 0);
+            assert_eq!(
+                krun_set_root_disk_remount(
+                    id,
+                    c"/dev/vda".as_ptr(),
+                    c"ext4".as_ptr(),
+                    c"rw".as_ptr()
+                ),
+                0
+            );
+        }
+        {
+            let contexts = CTX_MAP.lock().unwrap();
+            let resources = &contexts[&id].vmr;
+            assert_eq!(resources.block_bootstrap_fs, Some(1));
+            assert!(resources.fs[0].shared_dir.is_some());
+            assert_eq!(resources.fs[1].fs_id, "/dev/root");
+            assert!(resources.fs[1].shared_dir.is_none());
+        }
+        assert_eq!(krun_free_ctx(id), 0);
+    }
+
     #[test]
     fn invalid_input_consumes_descriptor_without_changing_process_credentials() {
         let (remote, local) = std::os::unix::net::UnixStream::pair().unwrap();

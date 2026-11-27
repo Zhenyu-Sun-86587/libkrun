@@ -5868,6 +5868,10 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                     });
                 }
 
+                #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                {
+                    ctx_cfg.vmr.block_bootstrap_fs = Some(ctx_cfg.vmr.fs.len());
+                }
                 ctx_cfg.vmr.add_fs_device(FsDeviceConfig {
                     fs_id: "/dev/root".into(),
                     shared_dir: None,

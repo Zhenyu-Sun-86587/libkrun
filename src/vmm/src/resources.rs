@@ -212,6 +212,14 @@ pub struct VmResources {
     /// The fs device.
     #[cfg(not(feature = "tee"))]
     pub fs: Vec<FsDeviceConfig>,
+    /// Position of the virtual-only filesystem built by the block-root API.
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "blk",
+        not(feature = "tee")
+    ))]
+    pub block_bootstrap_fs: Option<usize>,
     /// The vsock device.
     pub vsock: VsockBuilder,
     /// The virtio-blk device.
