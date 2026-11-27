@@ -4,6 +4,8 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::time::Instant;
 
 use socket2::Socket;
@@ -314,6 +316,10 @@ pub trait Proxy: Send {
     /// new connections; active connection proxies are dropped and re-established
     /// (see [`super::muxer::VsockMuxer::reset_connections`]).
     fn is_listener(&self) -> bool {
+        false
+    }
+    #[cfg(target_os = "linux")]
+    fn established_unix_peer(&self, _path: &Path) -> bool {
         false
     }
     /// If this proxy is a live TSI inbound-port-forward listener, return its

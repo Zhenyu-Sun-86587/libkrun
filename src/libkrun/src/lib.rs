@@ -2134,10 +2134,10 @@ fn handle_control_stream(
                 feature = "blk",
                 not(feature = "tee")
             ))]
-            if verb.starts_with("CAPTURE_KERNEL_")
+            if (verb.starts_with("CAPTURE_KERNEL_") || verb == "STANDBY_FORK_ENTER")
                 && !vmm::retained_fds::worker_recovery_peer(&stream)
             {
-                let _ = stream.write_all(b"ERR EPERM kernel CoW requires the Worker control peer\n");
+                let _ = stream.write_all(b"ERR EPERM capture requires the Worker control peer\n");
                 return;
             }
             #[cfg(all(
@@ -2167,6 +2167,7 @@ fn handle_control_stream(
                         | "CAPTURE_BLOCK_PIVOT"
                         | "CAPTURE_BLOCK_PIVOT_ABORT"
                         | "STANDBY_ENTER"
+                        | "STANDBY_FORK_ENTER"
                         | "STANDBY_QUERY"
                         | "STANDBY_WAKE"
                         | "GUEST_GATE_QUERY"
@@ -2312,7 +2313,7 @@ fn handle_control_stream(
                     feature = "blk",
                     not(feature = "tee")
                 ))]
-                "STANDBY_ENTER" | "STANDBY_QUERY" | "STANDBY_WAKE" => vmm
+                "STANDBY_ENTER" | "STANDBY_FORK_ENTER" | "STANDBY_QUERY" | "STANDBY_WAKE" => vmm
                     .lock()
                     .unwrap()
                     .standby_control(&verb, _arg)

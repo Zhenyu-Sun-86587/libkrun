@@ -1896,6 +1896,124 @@ fn listener_shutdown_closes_only_the_listener_and_can_listen_again() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn relay_fork_keeps_only_the_source_relay_and_fences_the_child() {
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::{DeviceState, VirtioDevice, Vsock};
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay_port = MANAGED_CREDENTIAL_RELAY_PORT;
+    let other_port = relay_port + 1;
+    let relay_path = dir.path().join("source-relay.sock");
+    let other_path = dir.path().join("other.sock");
+    let relay = UnixListener::bind(&relay_path).unwrap();
+    let other = UnixListener::bind(&other_path).unwrap();
+    let mut f = Fixture::new(TsiFlags::empty(), None);
+    f.muxer.unix_ipc_port_map = Some(HashMap::from([
+        (relay_port, (relay_path, false)),
+        (other_port, (other_path, false)),
+    ]));
+    for (port, listener) in [(relay_port, &relay), (other_port, &other)] {
+        listener.set_nonblocking(true).unwrap();
+        let mut pkt = f.packet(port, &[]);
+        pkt.set_type(uapi::VSOCK_TYPE_STREAM)
+            .set_op(uapi::VSOCK_OP_REQUEST)
+            .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32);
+        f.muxer.send_stream_pkt(&pkt).unwrap();
+    }
+    let (mut relay, _) = relay.accept().unwrap();
+    let (mut other, _) = other.accept().unwrap();
+    for peer in [&relay, &other] {
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    }
+    let relay_id = (u64::from(CONTROL) << 32) | u64::from(relay_port);
+    let original_relay = f.muxer.proxy_map.read().unwrap()[&relay_id].clone();
+    {
+        // The Guest has handled the connection handshakes before the cut.
+        let mut pending = f.muxer.rxq.lock().unwrap();
+        pending.clear();
+        for port in [relay_port, other_port] {
+            assert!(pending.push(MuxerRx::CreditUpdate {
+                local_port: port,
+                peer_port: CONTROL,
+                fwd_cnt: 0,
+            }));
+        }
+    }
+
+    let tx = TestQueue::new(GuestAddress(0x1000), &f.mem, 8);
+    f.packet(relay_port, b"before-cut").set_type(uapi::VSOCK_TYPE_STREAM);
+    let ev = TestQueue::new(GuestAddress(0x8000), &f.mem, 8);
+    ev.dtable[0].set(0x19000, 4, 2, 0);
+    ev.avail.ring[0].set(0);
+    ev.avail.idx.set(1);
+    let irq = InterruptTransport::new(DummyIrqChip::new().into(), "relay fork".into()).unwrap();
+    let mut source = Vsock::new(3, None, None, TsiFlags::empty(), None, None, None, None, None).unwrap();
+    source.queue_rx = f.muxer.queue.clone();
+    source.queue_tx = Some(Arc::new(Mutex::new(tx.create_queue())));
+    source.queue_ev = Some(Arc::new(Mutex::new(ev.create_queue())));
+    source.device_state = DeviceState::Activated(f.mem.clone(), irq.clone());
+    source.muxer = f.muxer;
+    assert!(source.supports_credential_relay_fork());
+    source.quiesce_for_snapshot();
+    assert!(!source.process_stream_tx());
+    source.fence_parked_source(true).unwrap();
+    let state = source.save_state();
+    assert!(state.parked_rebind);
+    assert_eq!(other.read(&mut [0; 1]).unwrap(), 0);
+    assert_eq!(source.muxer.proxy_map.read().unwrap().len(), 1);
+    assert!(Arc::ptr_eq(&original_relay, &source.muxer.proxy_map.read().unwrap()[&relay_id]));
+
+    let target_path = dir.path().join("target-relay.sock");
+    let mut target = Vsock::new(
+        4, None, Some(HashMap::from([(relay_port, (target_path, false))])),
+        TsiFlags::empty(), None, None, None, None, None,
+    ).unwrap();
+    target.defer_parked_backend().unwrap();
+    let target_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
+    let target_rx = TestQueue::new(GuestAddress(0x4000), &target_mem, 8);
+    let target_tx = TestQueue::new(GuestAddress(0x1000), &target_mem, 8);
+    let target_ev = TestQueue::new(GuestAddress(0x8000), &target_mem, 8);
+    let mut captured_ram = vec![0; 0x40000];
+    f.mem.read_slice(&mut captured_ram, GuestAddress(0)).unwrap();
+    target_mem.write_slice(&captured_ram, GuestAddress(0)).unwrap();
+    target.queue_rx = Some(Arc::new(Mutex::new(target_rx.create_queue())));
+    target.queue_tx = Some(Arc::new(Mutex::new(target_tx.create_queue())));
+    target.queue_ev = Some(Arc::new(Mutex::new(target_ev.create_queue())));
+    target.device_state = DeviceState::Activated(target_mem.clone(), irq);
+    target.restore_state(&state).unwrap();
+    assert_eq!(target_ev.used.idx.get(), 1);
+    assert!(!target.publish_parked_backend().unwrap());
+    assert!(target.process_stream_tx());
+    assert_eq!(target_tx.used.idx.get(), 1);
+    assert!(target.muxer.proxy_map.read().unwrap().is_empty());
+
+    relay.write_all(b"tail").unwrap();
+    source.rearm_after_snapshot();
+    assert_eq!(ev.used.idx.get(), 0);
+    assert!(source.process_stream_tx());
+    let mut bytes = [0; 10];
+    relay.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"before-cut");
+
+    let rx = TestQueue::new(GuestAddress(0x4000), &f.mem, 8);
+    for i in 0..3 {
+        rx.dtable[i].set(0x20000 + i as u64 * 0x100, 128, 2, 0);
+        rx.avail.ring[i].set(i as u16);
+    }
+    rx.avail.idx.set(3);
+    let update = original_relay.lock().unwrap().process_event(EventSet::IN);
+    assert!(update.signal_queue);
+    assert_eq!(rx.used.idx.get(), 3);
+    assert_eq!(f.mem.read_obj::<u16>(GuestAddress(0x20100 + 30)).unwrap(), uapi::VSOCK_OP_RST);
+    let mut tail = [0; 4];
+    f.mem.read_slice(&mut tail, GuestAddress(0x20200 + VSOCK_PKT_HDR_SIZE as u64)).unwrap();
+    assert_eq!(&tail, b"tail");
+}
+
+#[test]
 fn transport_reset_ack_is_not_blocked_by_a_guest_tx_reply() {
     use crate::legacy::DummyIrqChip;
     use crate::virtio::DeviceState;

@@ -128,6 +128,7 @@ enum Disposition {
 
 struct StandbyReceipt {
     managed: bool,
+    preserve_credential_relay: bool,
     sequence: u32,
     nonce: u128,
     disposition: Disposition,
@@ -140,6 +141,13 @@ pub(super) struct CaptureControl {
 }
 
 impl Vmm {
+    fn supports_credential_relay_fork(&self) -> Result<bool, String> {
+        Ok(self
+            .mmio_device_manager
+            .with_vsock(|vsock| Ok(vsock.supports_credential_relay_fork()))?
+            .unwrap_or(false))
+    }
+
     pub fn deep_control_holds_vmm(&self) -> bool {
         self.guest_gate
             .as_ref()
@@ -227,6 +235,9 @@ impl Vmm {
         {
             reply["memory_fork_profile"] = crate::kernel_cow::RAM_PROFILE.into();
         }
+        if self.supports_credential_relay_fork()? {
+            reply["credential_relay_fork"] = true.into();
+        }
         Ok(format!("OK {reply}\n"))
     }
 
@@ -255,14 +266,15 @@ impl Vmm {
             .and_then(|v| u128::from_str_radix(v, 16).ok())
             .filter(|v| *v > 0)
             .ok_or("EINVAL expected a 128-bit standby hold token")?;
-        let mode = if verb == "STANDBY_ENTER" {
-            Some(match fields.next() {
-                Some("raw") => false,
-                Some("managed") => true,
-                _ => return Err("EINVAL specify raw or managed standby".into()),
-            })
-        } else {
-            None
+        let mode = match (verb, fields.next()) {
+            ("STANDBY_ENTER", Some("raw")) => Some((false, false)),
+            ("STANDBY_ENTER", Some("managed")) => Some((true, false)),
+            ("STANDBY_FORK_ENTER", Some("managed")) => Some((true, true)),
+            ("STANDBY_ENTER" | "STANDBY_FORK_ENTER", _) => {
+                return Err("EINVAL invalid standby mode".into());
+            }
+            (_, None) => None,
+            _ => return Err("EINVAL trailing standby parameters".into()),
         };
         if fields.next().is_some() {
             return Err("EINVAL trailing standby parameters".into());
@@ -272,13 +284,14 @@ impl Vmm {
             .standby
             .as_ref()
             .is_some_and(|s| s.sequence == sequence && s.nonce == nonce);
-        if matching
-            && mode.is_some_and(|m| m != self.capture_control.standby.as_ref().unwrap().managed)
-        {
+        if matching && mode.is_some_and(|(managed, preserve)| {
+            let s = self.capture_control.standby.as_ref().unwrap();
+            (managed, preserve) != (s.managed, s.preserve_credential_relay)
+        }) {
             return Err("EINVAL standby mode differs from the original request".into());
         }
         match verb {
-            "STANDBY_ENTER" if !matching => {
+            "STANDBY_ENTER" | "STANDBY_FORK_ENTER" if !matching => {
                 if self
                     .capture_control
                     .standby
@@ -290,11 +303,12 @@ impl Vmm {
                 if self.deep_control_holds_vmm() || self.run_state != VmmRunState::Running {
                     return Err("EBUSY VMM is already held".into());
                 }
-                let managed = mode.unwrap();
+                let (managed, preserve_credential_relay) = mode.unwrap();
                 let permitted = {
                     let gate = self.guest_gate.as_ref().unwrap().lock().unwrap();
                     if managed {
-                        gate.parked(sequence, nonce) || gate.stop_parked(sequence, nonce)
+                        gate.parked(sequence, nonce)
+                            || (!preserve_credential_relay && gate.stop_parked(sequence, nonce))
                     } else {
                         gate.allows_raw_standby()
                     }
@@ -306,8 +320,12 @@ impl Vmm {
                 }
                 self.standby_profile(&self.mmio_device_manager.capture_inventory()?)
                     .map_err(|e| format!("ENOTSUP {e}"))?;
+                if preserve_credential_relay && !self.supports_credential_relay_fork()? {
+                    return Err("ENOTSUP source has no managed credential relay".into());
+                }
                 self.capture_control.standby = Some(StandbyReceipt {
                     managed,
+                    preserve_credential_relay,
                     sequence,
                     nonce,
                     disposition: Disposition::Unknown,
@@ -328,7 +346,7 @@ impl Vmm {
                     .map_err(|e| format!("EIO {e}"))?;
                 self.capture_control.standby.as_mut().unwrap().disposition = Disposition::Standby;
             }
-            "STANDBY_ENTER" | "STANDBY_QUERY" if matching => (),
+            "STANDBY_ENTER" | "STANDBY_FORK_ENTER" | "STANDBY_QUERY" if matching => (),
             "STANDBY_WAKE" if matching => {
                 match self.capture_control.standby.as_ref().unwrap().disposition {
                     Disposition::Standby => {
