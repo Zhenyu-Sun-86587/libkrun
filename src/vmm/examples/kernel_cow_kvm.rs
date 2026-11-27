@@ -338,7 +338,7 @@ mod smoke {
         }
 
         fn capture_twice_in_standby(source: &mut Vmm, memory: &GuestMemoryMmap) {
-            const STANDBY: &str = "2 00000000000000000000000000000002";
+            const STANDBY: &str = "2 00000000000000000000000000000022";
             park(source, memory, STANDBY);
             let stable = source
                 .standby_control("STANDBY_ENTER", &format!("{STANDBY} managed"))
