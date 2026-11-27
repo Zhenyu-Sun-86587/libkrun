@@ -4,6 +4,7 @@
 use super::{
     ActivateError, ActivateResult, DeviceQueue, InterruptTransport, QueueConfig, VirtioDevice,
 };
+use log::warn;
 use vm_memory::GuestMemoryMmap;
 
 mod target;
@@ -363,6 +364,9 @@ impl GuestGate {
         };
         if matches!(next, Phase::IdentityReady | Phase::FailedHeld) {
             self.identity_frame[64..].fill(0);
+        }
+        if next == Phase::FailedHeld {
+            warn!("Guest gate target {} failed with guest errno {error}", s.phase.wire());
         }
         if s.phase == Phase::Activating && next == Phase::Released {
             self.target_done = true;
