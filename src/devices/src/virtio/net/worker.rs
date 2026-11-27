@@ -457,7 +457,16 @@ impl NetWorker {
                     break;
                 }
                 Err(e @ WriteError::Internal(_) | e @ WriteError::ProcessNotRunning) => {
-                    return Err(TxError::Backend(e));
+                    // Return a failed transmission to the driver without replaying
+                    // it. A prepared TAP can reject writes while its link is down.
+                    // Keep the usual notification path for every completion in this batch.
+                    self.tx_frame_len = 0;
+                    tx_queue
+                        .add_used(&self.mem, head_index, 0)
+                        .map_err(TxError::QueueError)?;
+                    raise_irq = true;
+                    result = Err(TxError::Backend(e));
+                    break;
                 }
             }
         }
@@ -629,5 +638,104 @@ mod tests {
             assert!(worker.process_tx().is_ok(), "{kind:?}");
             assert_eq!(tx.used.idx.get(), 1, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn failed_tx_frames_complete_without_replay_or_losing_an_interrupt() {
+        struct ScriptedBackend(std::collections::VecDeque<(u8, Result<(), WriteError>)>);
+
+        impl NetBackend for ScriptedBackend {
+            fn read_frame(&mut self, _buf: &mut [u8]) -> Result<usize, ReadError> {
+                Err(ReadError::NothingRead)
+            }
+
+            fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError> {
+                let (packet, outcome) = self.0.pop_front().expect("unexpected TX attempt");
+                assert_eq!(buf[hdr_len], packet);
+                outcome
+            }
+
+            fn has_unfinished_write(&self) -> bool {
+                false
+            }
+
+            fn try_finish_write(&mut self, _hdr_len: usize, _buf: &[u8]) -> Result<(), WriteError> {
+                Ok(())
+            }
+
+            fn raw_socket_fd(&self) -> RawFd {
+                unreachable!("this test drives TX synchronously")
+            }
+        }
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let rx = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+        let tx = VirtQueue::new(GuestAddress(0x4000), &mem, 8);
+        let queue = |ring: &VirtQueue| {
+            let mut queue = ring.create_queue();
+            queue.set_event_idx(true);
+            DeviceQueue::new(
+                queue,
+                Arc::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap()),
+            )
+        };
+        for packet in 0..4 {
+            let offset = 0x10000 + packet as u64 * 64;
+            mem.write_slice(&[packet], GuestAddress(offset + VNET_HDR_LEN as u64))
+                .unwrap();
+            tx.dtable[usize::from(packet)].set(offset, (VNET_HDR_LEN + 1) as u32, 0, 0);
+            tx.avail.ring[usize::from(packet)].set(u16::from(packet));
+        }
+        tx.avail.idx.set(4);
+
+        let (ours, _peer) =
+            socket2::Socket::pair(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "net TX test".into()).unwrap();
+        let mut worker = NetWorker::new(
+            queue(&rx),
+            queue(&tx),
+            interrupt.clone(),
+            mem.clone(),
+            0,
+            VirtioNetBackend::UnixstreamFd(ours.into_raw_fd()),
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+        )
+        .unwrap();
+        let link_down = || WriteError::Internal(std::io::Error::from_raw_os_error(libc::ENETDOWN));
+        worker.backend = Box::new(ScriptedBackend(std::collections::VecDeque::from([
+            (0, Ok(())),
+            (1, Err(link_down())),
+            (2, Err(link_down())),
+            (3, Err(WriteError::NothingWritten)),
+            (3, Ok(())),
+        ])));
+
+        assert!(matches!(
+            worker.process_tx(),
+            Err(TxError::Backend(WriteError::Internal(_)))
+        ));
+        assert_eq!(tx.used.idx.get(), 2);
+        assert_ne!(
+            interrupt.status().load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        assert!(matches!(
+            worker.process_tx(),
+            Err(TxError::Backend(WriteError::Internal(_)))
+        ));
+        assert_eq!(tx.used.idx.get(), 3);
+
+        assert!(matches!(
+            worker.process_tx(),
+            Err(TxError::Backend(WriteError::NothingWritten))
+        ));
+        assert_eq!(worker.save_queue_states().1.next_avail, 3);
+        assert_eq!(tx.used.idx.get(), 3);
+
+        assert!(worker.process_tx().is_ok());
+        assert_eq!(tx.used.idx.get(), 4);
+        assert_eq!(tx.used.ring[3].get().id, 3);
     }
 }
