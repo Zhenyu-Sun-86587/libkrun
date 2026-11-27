@@ -202,9 +202,15 @@ impl NetBackend for Tap {
 
     /// Try to write a frame to the tap device.
     fn write_frame(&mut self, _hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError> {
-        let ret = write(self.fd.as_ref(), buf).map_err(|e| WriteError::Internal(e.into()))?;
-        debug!("Written frame size={}, written={}", buf.len(), ret);
-        Ok(())
+        match write(self.fd.as_ref(), buf) {
+            Ok(length) if length == buf.len() => Ok(()),
+            Ok(_) => Err(WriteError::Internal(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short TAP packet write",
+            ))),
+            Err(nix::errno::Errno::EAGAIN) => Err(WriteError::NothingWritten),
+            Err(error) => Err(WriteError::Internal(error.into())),
+        }
     }
 
     fn has_unfinished_write(&self) -> bool {
