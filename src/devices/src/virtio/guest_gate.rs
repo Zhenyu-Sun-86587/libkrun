@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Host-controlled freezer mailbox. This transport has no DMA queues. Its
 //! session and guest acknowledgements belong to one live VMM.
+use std::io::{stderr, Write};
+
 use super::{
     ActivateError, ActivateResult, DeviceQueue, InterruptTransport, QueueConfig, VirtioDevice,
 };
-use log::warn;
 use vm_memory::GuestMemoryMmap;
 
 mod target;
@@ -366,7 +367,13 @@ impl GuestGate {
             self.identity_frame[64..].fill(0);
         }
         if next == Phase::FailedHeld {
-            warn!("Guest gate target {} failed with guest errno {error}", s.phase.wire());
+            // Managed VMM stderr is scoped to this execution, even when
+            // the embedder has not installed a libkrun logger.
+            let _ = writeln!(
+                stderr().lock(),
+                "Guest gate target {} failed with guest errno {error}",
+                s.phase.wire()
+            );
         }
         if s.phase == Phase::Activating && next == Phase::Released {
             self.target_done = true;
