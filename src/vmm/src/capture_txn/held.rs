@@ -50,6 +50,7 @@ pub(super) struct Capture {
     token: Token,
     managed: bool,
     from_standby: bool,
+    preserve_credential_relay: bool,
     cancelled: bool,
     phase: Phase,
     point: Option<Arc<HeldExport>>,
@@ -88,13 +89,14 @@ impl Capture {
             Phase::FailedHeld => ("failed", "FAILED_HELD"),
             Phase::Unknown => ("failed", "UNKNOWN"),
         };
-        format!(
-            "OK {}\n",
-            json!({"protocol":"CaptureControl/1", "mode": if self.managed {"parked"} else {"raw"},
+        let mut reply = json!({"protocol":"CaptureControl/1", "mode": if self.managed {"parked"} else {"raw"},
           "session":self.token.session, "hold_token":format!("{:032x}",self.token.nonce),
           "phase":phase,"source_disposition":disposition, "clone_ready":false, "error":self.error,
-          "from_standby":self.from_standby,"stop_reserved":self.stop_reserved})
-        )
+          "from_standby":self.from_standby,"stop_reserved":self.stop_reserved});
+        if self.preserve_credential_relay {
+            reply["credential_relay_fork"] = true.into();
+        }
+        format!("OK {reply}\n")
     }
 }
 
@@ -326,8 +328,9 @@ impl Vmm {
         self.devices_quiesced = true;
         self.mmio_device_manager.validate_standby_boundary()?;
         if managed {
+            let preserve = self.capture_control.capture.as_ref().unwrap().preserve_credential_relay;
             self.mmio_device_manager
-                .with_vsock(|vsock| vsock.fence_parked_source())?;
+                .with_vsock(|vsock| vsock.fence_parked_source(preserve))?;
         }
         let inventory = self.mmio_device_manager.capture_inventory()?;
         let vcpu_states = self.save_vcpu_states().map_err(|e| e.to_string())?;
@@ -474,6 +477,8 @@ impl Vmm {
                         && s.nonce == token.nonce
                         && s.disposition == super::Disposition::Standby
                 });
+            let preserve_credential_relay = from_standby
+                && self.capture_control.standby.as_ref().unwrap().preserve_credential_relay;
             if from_standby {
                 if self.run_state != VmmRunState::Paused
                     || !self.devices_quiesced
@@ -524,6 +529,7 @@ impl Vmm {
                 token,
                 managed,
                 from_standby,
+                preserve_credential_relay,
                 cancelled: false,
                 phase: Phase::Unknown,
                 point: None,
@@ -575,6 +581,7 @@ impl Vmm {
         } else if matches!(verb, "CAPTURE_STOP_RESERVE" | "CAPTURE_STOP_UNRESERVE") {
             let record = self.capture_control.capture.as_mut().unwrap();
             if !record.managed
+                || record.preserve_credential_relay
                 || record.phase != Phase::Held
                 || (!record.writers.is_empty() && !record.writers_committed)
             {

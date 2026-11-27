@@ -70,6 +70,7 @@ pub struct Vsock {
     pub(crate) awaiting_transport_reset_ack: bool,
     /// Listener metadata captured after host handlers and RX producers stop.
     quiesced_listeners: Option<Vec<ListenerDesc>>,
+    parked_snapshot_rebind: bool,
     reset_source_on_resume: bool,
     defer_parked_backend: bool,
     parked_reset_refill: Option<u16>,
@@ -115,6 +116,7 @@ impl Vsock {
             pending_transport_reset: false,
             awaiting_transport_reset_ack: false,
             quiesced_listeners: None,
+            parked_snapshot_rebind: false,
             reset_source_on_resume: false,
             defer_parked_backend: false,
             parked_reset_refill: None,
@@ -141,10 +143,15 @@ impl Vsock {
         Ok(())
     }
 
-    /// The parked Guest and the muxer are already quiesced. No source host
-    /// socket or queued TX may survive this capture boundary.
     #[cfg(target_os = "linux")]
-    pub fn fence_parked_source(&mut self) -> Result<(), String> {
+    pub fn supports_credential_relay_fork(&self) -> bool {
+        self.is_activated() && self.muxer.credential_relay_path().is_some()
+    }
+
+    /// Fence the parked Guest's host connections. The target always resets
+    /// its transport. The original execution can keep its credential relay.
+    #[cfg(target_os = "linux")]
+    pub fn fence_parked_source(&mut self, preserve_relay: bool) -> Result<(), String> {
         if self.parked_binding().is_none()
             || self.quiesced_listeners.is_none()
             || self.awaiting_transport_reset_ack
@@ -170,9 +177,15 @@ impl Vsock {
         if !writable {
             return Err("parked vsock has an invalid transport reset buffer".into());
         }
-        self.discard_parked_tx()?;
-        self.reset_source_on_resume = true;
-        self.muxer.fence_parked_peers()
+        if preserve_relay {
+            self.muxer.fence_fork_peers()?;
+        } else {
+            self.discard_parked_tx()?;
+            self.reset_source_on_resume = true;
+            self.muxer.fence_parked_peers()?;
+        }
+        self.parked_snapshot_rebind = true;
+        Ok(())
     }
 
     fn discard_parked_tx(&self) -> Result<bool, String> {
@@ -279,7 +292,10 @@ impl Vsock {
         };
 
         let mut have_used = false;
-        if self.defer_parked_backend || self.muxer.rx_held_for_transport_reset() {
+        if self.quiesced_listeners.is_some()
+            || self.defer_parked_backend
+            || self.muxer.rx_held_for_transport_reset()
+        {
             return have_used;
         }
 
@@ -324,6 +340,9 @@ impl Vsock {
     /// them. Return `true` if descriptors have been added to the used ring, and `false` otherwise.
     pub fn process_stream_tx(&mut self) -> bool {
         debug!("process_stream_tx()");
+        if self.quiesced_listeners.is_some() {
+            return false;
+        }
         if self.defer_parked_backend || self.parked_reset_refill.is_some() {
             return self.discard_parked_tx().unwrap_or_else(|err| {
                 error!("{err}");
@@ -462,7 +481,7 @@ impl Vsock {
                 .quiesced_listeners
                 .clone()
                 .unwrap_or_else(|| self.muxer.snapshot_listeners()),
-            parked_rebind: self.reset_source_on_resume,
+            parked_rebind: self.parked_snapshot_rebind,
         }
     }
 
@@ -566,7 +585,8 @@ impl VirtioDevice for Vsock {
     }
 
     fn rearm_after_snapshot(&mut self) {
-        self.quiesced_listeners = None;
+        let was_quiesced = self.quiesced_listeners.take().is_some();
+        self.parked_snapshot_rebind = false;
         if std::mem::take(&mut self.reset_source_on_resume) {
             if let Err(error) = self.post_parked_reset() {
                 error!("cannot rearm parked source vsock: {error}");
@@ -576,6 +596,14 @@ impl VirtioDevice for Vsock {
             return;
         }
         self.muxer.rearm_after_snapshot();
+        if was_quiesced {
+            // The event loop can consume kicks while the queues are held.
+            for event in self.queue_events.iter().take(TXQ_INDEX + 1) {
+                if let Err(e) = event.write(1) {
+                    error!("cannot rearm a vsock queue event: {e}");
+                }
+            }
+        }
     }
 
     fn avail_features(&self) -> u64 {

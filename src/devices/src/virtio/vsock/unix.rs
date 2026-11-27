@@ -437,6 +437,12 @@ impl Proxy for UnixProxy {
         self.status
     }
 
+    #[cfg(target_os = "linux")]
+    fn established_unix_peer(&self, path: &std::path::Path) -> bool {
+        self.path == path
+            && matches!(self.status, ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate)
+    }
+
     fn connect(&mut self, _pkt: &VsockPacket, _req: TsiConnectReq) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
