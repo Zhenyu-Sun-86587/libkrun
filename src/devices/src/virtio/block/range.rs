@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -117,8 +118,7 @@ impl ManagedRange {
 #[derive(Debug)]
 pub(super) struct RemoteStorage {
     source: ManagedRange,
-    // Retain the original identity for held-pivot ancestry checks.
-    _identity: File,
+    identity: File,
     helper: CommonStorageHelper,
 }
 
@@ -126,9 +126,18 @@ impl RemoteStorage {
     pub(super) fn new(source: ManagedRange, identity: File) -> Self {
         Self {
             source,
-            _identity: identity,
+            identity,
             helper: CommonStorageHelper::default(),
         }
+    }
+
+    fn read(&self, buffer: &mut [u8], offset: u64) -> io::Result<()> {
+        if self.source.read_exact_at(buffer, offset).is_err() {
+            // The identity is the same sealed local inode that the Worker
+            // verified against this remote range; it survives carrier loss.
+            self.identity.read_exact_at(buffer, offset)?;
+        }
+        Ok(())
     }
 }
 
@@ -147,7 +156,7 @@ impl Storage for RemoteStorage {
         let mut bytes = vec![0; buf.len() as usize];
         let length = self.source.size.saturating_sub(offset).min(buf.len()) as usize;
         if length != 0 {
-            self.source.read_exact_at(&mut bytes[..length], offset)?;
+            self.read(&mut bytes[..length], offset)?;
         }
         buf.copy_from_slice(&bytes);
         Ok(())
@@ -178,6 +187,19 @@ impl Storage for RemoteStorage {
 mod tests {
     use super::*;
     use std::thread;
+
+    #[test]
+    fn lost_broker_reads_the_same_sealed_inode() {
+        let (client, broker) = UnixStream::pair().unwrap();
+        let mut identity = tempfile::tempfile().unwrap();
+        identity.write_all(b"sealed").unwrap();
+        let storage = RemoteStorage::new(ManagedRange::new(client, 6).unwrap(), identity);
+        drop(broker);
+
+        let mut bytes = [0; 4];
+        storage.read(&mut bytes, 1).unwrap();
+        assert_eq!(&bytes, b"eale");
+    }
 
     #[test]
     fn broker_retries_a_complete_error_and_checks_range_framing() {
