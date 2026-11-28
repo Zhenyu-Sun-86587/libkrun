@@ -91,7 +91,7 @@ fn validate_layers(layers: &[ManagedLayer], writable: bool) -> io::Result<Vec<(u
 
 fn read_only_backing(layer: ManagedLayer, backing: Backing) -> io::Result<ImageAccess> {
     let storage: StorageFile = match layer.range {
-        Some(range) => Box::new(RemoteStorage::new(range)),
+        Some(range) => Box::new(RemoteStorage::new(range, layer.file)),
         None => Box::new(ImageFile::try_from(layer.file)?),
     };
     let access = match layer.format {
@@ -140,7 +140,7 @@ fn open_layers(layers: Vec<ManagedLayer>, writable: bool) -> io::Result<(Arc<Dis
         parent = Some((id, format, access));
     }
     let (storage, discard): (StorageFile, usize) = match top.range {
-        Some(range) => (Box::new(RemoteStorage::new(range)), 4096),
+        Some(range) => (Box::new(RemoteStorage::new(range, top.file)), 4096),
         None => {
             let file = ImageFile::try_from(top.file)?;
             let discard = file.discard_align();

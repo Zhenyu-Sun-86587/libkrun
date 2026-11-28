@@ -5,6 +5,7 @@ use imago::Storage;
 use imago::io_buffers::{IoVector, IoVectorMut};
 use imago::storage::drivers::CommonStorageHelper;
 use std::fmt::{self, Display, Formatter};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::AsRawFd;
@@ -116,13 +117,16 @@ impl ManagedRange {
 #[derive(Debug)]
 pub(super) struct RemoteStorage {
     source: ManagedRange,
+    // Retain the original identity for held-pivot ancestry checks.
+    _identity: File,
     helper: CommonStorageHelper,
 }
 
 impl RemoteStorage {
-    pub(super) fn new(source: ManagedRange) -> Self {
+    pub(super) fn new(source: ManagedRange, identity: File) -> Self {
         Self {
             source,
+            _identity: identity,
             helper: CommonStorageHelper::default(),
         }
     }
