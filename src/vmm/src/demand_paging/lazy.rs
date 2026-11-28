@@ -586,7 +586,7 @@ mod tests {
         let _serial = lock(&SERIAL);
         let dir = tempfile::tempdir().unwrap();
         let data = stored(dir.path(), &[Some(3), None, Some(7), Some(9)]);
-        let (memory, _pager, file) = start(dir.path(), data.len());
+        let (memory, pager, file) = start(dir.path(), data.len());
         // Guest reads across every chunk, including the one of zeros.
         for (i, chunk) in data.chunks(CS).enumerate() {
             let mut page = [0_u8; 64];
@@ -598,12 +598,16 @@ mod tests {
         // A guest write stays private; the memfd keeps the checkpoint.
         memory.write_slice(&[0xee; 8], GuestAddress(0)).unwrap();
         wait_complete().unwrap();
-        assert!(dir.path().join("complete").exists());
         let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+        assert!(seals >= 0, "could not read the memfd seals");
         assert!(seals & libc::F_SEAL_WRITE != 0, "sealed once complete");
         let mut base = vec![0_u8; data.len()];
         file.read_exact_at(&mut base, 0).unwrap();
         assert_eq!(base, data);
+
+        // The marker is written by the pager after it publishes the seal.
+        drop(pager);
+        assert_eq!(std::fs::read(dir.path().join("complete")).unwrap(), b"1\n");
     }
 
     #[test]
