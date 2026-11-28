@@ -2,6 +2,7 @@
 
 use super::{CTX_MAP, KRUN_SUCCESS, set_last_error};
 use devices::virtio::block::managed::{ManagedAttachment, ManagedLayer};
+use devices::virtio::block::range::ManagedRange;
 use devices::virtio::block::{Block, ImageType};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, c_char};
@@ -9,6 +10,7 @@ use std::fs::File;
 use std::io;
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
 const MAX_DEVICES: usize = 64;
@@ -61,7 +63,10 @@ unsafe fn identifier(id: *const c_char) -> io::Result<String> {
     Ok(String::from_utf8(value.to_vec()).expect("validated ASCII identifier"))
 }
 
-unsafe fn prepare_specs(specs: &[KrunManagedBlockV1]) -> io::Result<VecDeque<Arc<Mutex<Block>>>> {
+unsafe fn prepare_specs(
+    specs: &[KrunManagedBlockV1],
+    ranges: &HashMap<String, ManagedRange>,
+) -> io::Result<VecDeque<Arc<Mutex<Block>>>> {
     let mut devices = HashSet::new();
     let mut attachments = HashSet::new();
     let mut volumes = HashSet::new();
@@ -146,6 +151,7 @@ unsafe fn prepare_specs(specs: &[KrunManagedBlockV1]) -> io::Result<VecDeque<Arc
             }
             identities.insert(identity, (resource_id.clone(), writable));
             layers.push(ManagedLayer {
+                range: ranges.get(&resource_id).cloned(),
                 resource_id,
                 format,
                 file,
@@ -171,6 +177,11 @@ unsafe fn prepare_specs(specs: &[KrunManagedBlockV1]) -> io::Result<VecDeque<Arc
         )?;
         blocks.push_back(Arc::new(Mutex::new(block)));
     }
+    if ranges.keys().any(|id| !resources.contains_key(id)) {
+        return Err(invalid(
+            "managed range does not identify an attached resource",
+        ));
+    }
     Ok(blocks)
 }
 
@@ -189,20 +200,80 @@ pub unsafe extern "C" fn krun_attach_block_set_v1(
         return -libc::EINVAL;
     }
     let specs = unsafe { std::slice::from_raw_parts(specs, count) };
-    let blocks = match unsafe { prepare_specs(specs) } {
+    let ranges = {
+        let mut contexts = CTX_MAP.lock().unwrap();
+        let Some(cfg) = contexts.get_mut(&ctx_id) else {
+            return -libc::ENOENT;
+        };
+        if cfg.managed_block_preparing
+            || !cfg.block_cfgs.is_empty()
+            || !cfg.vmr.block.list.is_empty()
+            || cfg.snapshot_dir.is_some()
+        {
+            return -libc::EINVAL;
+        }
+        cfg.managed_block_preparing = true;
+        cfg.managed_block_ranges.clone()
+    };
+    let blocks = unsafe { prepare_specs(specs, &ranges) };
+    let mut contexts = CTX_MAP.lock().unwrap();
+    let Some(cfg) = contexts.get_mut(&ctx_id) else {
+        return -libc::ENOENT;
+    };
+    cfg.managed_block_preparing = false;
+    let blocks = match blocks {
         Ok(blocks) => blocks,
         Err(error) => {
             set_last_error(format!("prepare managed block set: {error}"));
             return -error.raw_os_error().unwrap_or(libc::EINVAL);
         }
     };
+    if !cfg.block_cfgs.is_empty() || !cfg.vmr.block.list.is_empty() || cfg.snapshot_dir.is_some() {
+        return -libc::EINVAL;
+    }
+    cfg.managed_block_ranges.clear();
+    cfg.vmr.block.list = blocks;
+    KRUN_SUCCESS
+}
+
+/// Bind an already connected range broker to an immutable layer. The
+/// caller keeps ownership of the original connection FD.
+///
+/// # Safety
+/// The resource ID must be readable as a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_set_managed_block_range_v1(
+    ctx_id: u32,
+    resource_id: *const c_char,
+    fd: i32,
+    member_bytes: u64,
+) -> i32 {
+    let id = match unsafe { identifier(resource_id) } {
+        Ok(id) => id,
+        Err(_) => return -libc::EINVAL,
+    };
     let mut contexts = CTX_MAP.lock().unwrap();
     let Some(cfg) = contexts.get_mut(&ctx_id) else {
         return -libc::ENOENT;
     };
-    if !cfg.block_cfgs.is_empty() || !cfg.vmr.block.list.is_empty() || cfg.snapshot_dir.is_some() {
+    if cfg.managed_block_preparing
+        || !cfg.block_cfgs.is_empty()
+        || !cfg.vmr.block.list.is_empty()
+        || cfg.snapshot_dir.is_some()
+        || cfg.managed_block_ranges.len() >= MAX_REFERENCED_FDS
+        || cfg.managed_block_ranges.contains_key(&id)
+    {
         return -libc::EINVAL;
     }
-    cfg.vmr.block.list = blocks;
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return -libc::EBADF;
+    }
+    let stream = unsafe { UnixStream::from_raw_fd(duplicate) };
+    let range = match ManagedRange::new(stream, member_bytes) {
+        Ok(range) => range,
+        Err(error) => return -error.raw_os_error().unwrap_or(libc::EINVAL),
+    };
+    cfg.managed_block_ranges.insert(id, range);
     KRUN_SUCCESS
 }

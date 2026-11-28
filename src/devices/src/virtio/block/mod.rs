@@ -6,6 +6,8 @@ pub mod device;
 pub mod lazy;
 #[cfg(target_os = "linux")]
 pub mod managed;
+#[cfg(target_os = "linux")]
+pub mod range;
 mod worker;
 
 pub use self::device::{Block, BlockState, CacheType, create_overlay};

@@ -2,9 +2,10 @@
 //! Block devices with an explicit Worker-owned closure of open files.
 
 use super::device::{DiskBackend, DiskProperties, PreparedDiskPivot, disk_backend};
+use super::range::{ManagedRange, RemoteStorage};
 use super::{Block, BlockIoEngine, CacheType, ImageType, SECTOR_SIZE, SyncMode};
 use imago::{DynStorage, FormatAccess, Storage, file::File as ImageFile, qcow2::Qcow2, raw::Raw};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -29,12 +30,14 @@ pub(crate) struct ManagedDiskState {
     attachment: ManagedAttachment,
     writer: Option<File>,
     identities: Vec<(u64, u64)>,
+    ranges: HashMap<String, ManagedRange>,
 }
 
 pub struct ManagedLayer {
     pub resource_id: String,
     pub format: ImageType,
     pub file: File,
+    pub range: Option<ManagedRange>,
 }
 
 type StorageFile = Box<dyn DynStorage>;
@@ -66,7 +69,11 @@ fn validate_layers(layers: &[ManagedLayer], writable: bool) -> io::Result<Vec<(u
         } else {
             libc::O_RDONLY
         };
-        if !meta.is_file()
+        if layer
+            .range
+            .as_ref()
+            .is_some_and(|range| access != libc::O_RDONLY || range.size() != meta.len())
+            || !meta.is_file()
             || flags < 0
             || flags & (libc::O_PATH | libc::O_APPEND | libc::O_DIRECT) != 0
             || flags & libc::O_ACCMODE != access
@@ -83,7 +90,10 @@ fn validate_layers(layers: &[ManagedLayer], writable: bool) -> io::Result<Vec<(u
 }
 
 fn read_only_backing(layer: ManagedLayer, backing: Backing) -> io::Result<ImageAccess> {
-    let storage: StorageFile = Box::new(ImageFile::try_from(layer.file)?);
+    let storage: StorageFile = match layer.range {
+        Some(range) => Box::new(RemoteStorage::new(range)),
+        None => Box::new(ImageFile::try_from(layer.file)?),
+    };
     let access = match layer.format {
         ImageType::Raw if backing.is_none() => {
             FormatAccess::new(Raw::open_image_sync(storage, false)?)
@@ -129,9 +139,14 @@ fn open_layers(layers: Vec<ManagedLayer>, writable: bool) -> io::Result<(Arc<Dis
         let access = read_only_backing(layer, parent)?;
         parent = Some((id, format, access));
     }
-    let file = ImageFile::try_from(top.file)?;
-    let discard = file.discard_align();
-    let storage: StorageFile = Box::new(file);
+    let (storage, discard): (StorageFile, usize) = match top.range {
+        Some(range) => (Box::new(RemoteStorage::new(range)), 4096),
+        None => {
+            let file = ImageFile::try_from(top.file)?;
+            let discard = file.discard_align();
+            (Box::new(file), discard)
+        }
+    };
     let backend = match top.format {
         ImageType::Raw if parent.is_none() => disk_backend(
             Raw::open_image_sync(storage, writable)?,
@@ -188,6 +203,15 @@ impl ManagedDiskState {
             attachment,
             writer,
             identities,
+            ranges: layers
+                .iter()
+                .filter_map(|layer| {
+                    layer
+                        .range
+                        .clone()
+                        .map(|range| (layer.resource_id.clone(), range))
+                })
+                .collect(),
         })
     }
 }
@@ -245,7 +269,7 @@ impl Block {
     pub fn prepare_managed_live_pivot(
         &self,
         attachment: ManagedAttachment,
-        layers: Vec<ManagedLayer>,
+        mut layers: Vec<ManagedLayer>,
     ) -> io::Result<PreparedDiskPivot> {
         let current = self
             .managed_disk
@@ -256,6 +280,11 @@ impl Block {
             return Err(invalid(
                 "managed block must be writable, drained and have a clean flush",
             ));
+        }
+        for layer in layers.iter_mut().skip(1) {
+            if let Some(range) = current.ranges.get(&layer.resource_id) {
+                layer.range = Some(range.clone());
+            }
         }
         let state = ManagedDiskState::prepare(attachment, &layers)?;
         let next = &state.attachment;

@@ -1074,6 +1074,7 @@ impl Held {
                     resource_id: layer.resource_id.clone(),
                     format,
                     file: file.try_clone().map_err(|e| e.to_string())?,
+                    range: None,
                 });
             }
             targets.push(ManagedBlockTarget { attachment, layers });

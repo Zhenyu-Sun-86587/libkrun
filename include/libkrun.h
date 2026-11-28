@@ -298,6 +298,16 @@ struct krun_managed_block_v1 {
  * open file descriptions. The caller retains ownership of its FD numbers.
  * QCOW2 layer headers must name the exact backing resource ID and format.
  */
+/* Optional immutable block layer reader, installed before the managed block set.
+ * The connected AF_UNIX stream must be dedicated to this execution and resource.
+ * The Worker still supplies the layer's O_RDONLY identity FD at attachment.
+ * The original connection FD remains caller-owned.
+ */
+int32_t krun_set_managed_block_range_v1(uint32_t ctx_id,
+                                       const char *resource_id,
+                                       int32_t connected_fd,
+                                       uint64_t member_bytes);
+
 int32_t krun_attach_block_set_v1(uint32_t ctx_id,
                                   const struct krun_managed_block_v1 *specs,
                                   size_t count);

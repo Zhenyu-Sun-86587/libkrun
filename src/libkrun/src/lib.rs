@@ -247,6 +247,10 @@ struct ContextConfig {
     vsock_config: VsockConfig,
     #[cfg(feature = "blk")]
     block_cfgs: Vec<BlockDeviceConfig>,
+    #[cfg(all(target_os = "linux", feature = "blk", not(feature = "tee")))]
+    managed_block_ranges: HashMap<String, devices::virtio::block::range::ManagedRange>,
+    #[cfg(all(target_os = "linux", feature = "blk", not(feature = "tee")))]
+    managed_block_preparing: bool,
     #[cfg(feature = "blk")]
     block_root: Option<BlockRootConfig>,
     #[cfg(feature = "tee")]

@@ -992,6 +992,7 @@ mod tests {
                     resource_id: old_name.into(),
                     format: ImageType::Raw,
                     file: opened,
+                    range: None,
                 }],
             )
             .unwrap();
@@ -1019,6 +1020,7 @@ mod tests {
                         ManagedLayer {
                             resource_id: next.layers[0].clone(),
                             format: ImageType::Qcow2,
+                            range: None,
                             file: OpenOptions::new()
                                 .read(true)
                                 .write(true)
@@ -1029,6 +1031,7 @@ mod tests {
                             resource_id: next.layers[1].clone(),
                             format: ImageType::Raw,
                             file: File::open(original_alias.unwrap_or(&original)).unwrap(),
+                            range: None,
                         },
                     ],
                 },
