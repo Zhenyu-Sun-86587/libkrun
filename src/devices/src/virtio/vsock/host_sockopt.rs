@@ -345,6 +345,8 @@ mod tests {
             for datagram in [false, true] {
                 let kind = if datagram { Type::DGRAM } else { Type::STREAM };
                 let socket = Socket::new(domain, kind, None).unwrap();
+                #[cfg(target_os = "linux")]
+                let native_socket = Socket::new(domain, kind, None).unwrap();
                 let mut buffers = SocketBuffers::default();
                 for capacity in [8192, 131072, 2097152, i32::MAX] {
                     for option in [7, 8] {
@@ -357,16 +359,32 @@ mod tests {
                         } else {
                             socket.recv_buffer_size().unwrap()
                         };
-                        let expected = if cfg!(not(target_os = "linux")) && datagram && option == 7
+                        #[cfg(target_os = "linux")]
                         {
-                            (capacity as usize).max(128 * 1024)
-                        } else {
-                            capacity as usize
-                        };
-                        if capacity != i32::MAX {
+                            // Linux doubles the requested value for bookkeeping and can
+                            // clamp it to the host's limit. Observe both on a native socket.
+                            let bytes = capacity as usize / 2;
+                            let expected = if option == 7 {
+                                native_socket.set_send_buffer_size(bytes).unwrap();
+                                native_socket.send_buffer_size().unwrap()
+                            } else {
+                                native_socket.set_recv_buffer_size(bytes).unwrap();
+                                native_socket.recv_buffer_size().unwrap()
+                            };
                             assert_eq!(actual, expected);
-                        } else {
-                            assert!(actual > 0 && actual <= capacity as usize);
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            let expected = if datagram && option == 7 {
+                                (capacity as usize).max(128 * 1024)
+                            } else {
+                                capacity as usize
+                            };
+                            if capacity != i32::MAX {
+                                assert_eq!(actual, expected);
+                            } else {
+                                assert!(actual > 0 && actual <= capacity as usize);
+                            }
                         }
                         let effective = if option == 7 {
                             buffers.send
