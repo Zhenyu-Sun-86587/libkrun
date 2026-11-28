@@ -2,6 +2,7 @@
 
 use devices::virtio::block::ImageType;
 use devices::virtio::block::managed::{ManagedAttachment, ManagedLayer};
+use devices::virtio::block::range::ManagedRange;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
@@ -9,6 +10,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -779,6 +781,8 @@ fn transact(
 struct Offer {
     pivot: Receipt,
     block_sets: Vec<BlockSet>,
+    #[serde(default)]
+    bucket_ranges: BTreeMap<String, u64>,
 }
 
 #[derive(Deserialize)]
@@ -1006,11 +1010,24 @@ impl Held {
     fn targets(
         &self,
         offer: Vec<BlockSet>,
+        bucket_ranges: BTreeMap<String, u64>,
         table: Vec<Entry>,
         handles: Vec<OwnedFd>,
     ) -> Result<Vec<ManagedBlockTarget>, String> {
         let mut resources = BTreeMap::new();
+        let mut ranges = BTreeMap::new();
         for (entry, file) in table.into_iter().zip(handles) {
+            if entry.role == "bucket_range" {
+                let bytes = bucket_ranges
+                    .get(&entry.resource_id)
+                    .ok_or("EIO unexpected Worker range descriptor")?;
+                let range = ManagedRange::new(UnixStream::from(file), *bytes)
+                    .map_err(|error| error.to_string())?;
+                if ranges.insert(entry.resource_id, range).is_some() {
+                    return Err("EIO Worker returned duplicate range capability".into());
+                }
+                continue;
+            }
             if resources
                 .insert(entry.resource_id, (entry.role, File::from(file)))
                 .is_some()
@@ -1020,6 +1037,7 @@ impl Held {
         }
         let mut targets = Vec::new();
         let mut used = HashSet::new();
+        let mut used_ranges = HashSet::new();
         if offer.len() != self.heads.len() {
             return Err("EIO Worker returned an incomplete writable block set".into());
         }
@@ -1070,16 +1088,28 @@ impl Held {
                     "qcow2" => ImageType::Qcow2,
                     _ => return Err("EIO Worker returned an unsupported block format".into()),
                 };
+                let range = ranges.get(&layer.resource_id);
+                if let Some(range) = range {
+                    if index == 0
+                        || file.metadata().map_err(|e| e.to_string())?.len() != range.size()
+                    {
+                        return Err("EIO Worker range differs from its immutable backing".into());
+                    }
+                    used_ranges.insert(layer.resource_id.clone());
+                }
                 layers.push(ManagedLayer {
                     resource_id: layer.resource_id.clone(),
                     format,
                     file: file.try_clone().map_err(|e| e.to_string())?,
-                    range: None,
+                    range: range.cloned(),
                 });
             }
             targets.push(ManagedBlockTarget { attachment, layers });
         }
-        if used.len() != resources.len() {
+        if used.len() != resources.len()
+            || used_ranges.len() != ranges.len()
+            || used_ranges.len() != bucket_ranges.len()
+        {
             return Err("EIO Worker returned unreferenced descriptors".into());
         }
         Ok(targets)
@@ -1155,7 +1185,12 @@ impl Held {
             let offer: Offer = serde_json::from_value(response.result)
                 .map_err(|_| "EIO invalid WriterPivot offer")?;
             self.verify(config, &offer.pivot, "offered")?;
-            let targets = self.targets(offer.block_sets, response.table, response.fds)?;
+            let targets = self.targets(
+                offer.block_sets,
+                offer.bucket_ranges,
+                response.table,
+                response.fds,
+            )?;
             let result = vmm.lock().unwrap().pivot_managed_blocks_held(targets);
             match result {
                 Ok(rollback) => {
